@@ -34,9 +34,18 @@ def get_version() -> Dict[str, Any]:
     if _version_cache is not None:
         return _version_cache
 
-    version_file: Path = Path(__file__).parent.parent.parent / "version.json"
+    # Check multiple locations for version.json
+    candidates = [
+        Path(__file__).parent.parent.parent / "version.json",
+        Path(__file__).parent.parent / "version.json",
+        Path("/app/version.json"),
+    ]
 
-    with open(version_file, "r") as f:
-        _version_cache = json.load(f)
+    for version_file in candidates:
+        if version_file.exists():
+            with open(version_file, "r") as f:
+                _version_cache = json.load(f)
+            return _version_cache
 
+    _version_cache = {"version": "1.0.0", "codename": "Hydra"}
     return _version_cache

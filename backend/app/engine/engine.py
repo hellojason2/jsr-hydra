@@ -28,7 +28,10 @@ from app.risk.position_sizer import PositionSizer
 from app.risk.risk_manager import RiskManager
 from app.engine.regime_detector import RegimeDetector
 from app.strategies.base import BaseStrategy
+from app.strategies.strategy_a import StrategyA
 from app.strategies.strategy_b import StrategyB
+from app.strategies.strategy_c import StrategyC
+from app.strategies.strategy_d import StrategyD
 from app.utils.logger import get_logger
 from app.utils import time_utils
 
@@ -279,15 +282,11 @@ class TradingEngine:
         try:
             # Create kill switch
             self._kill_switch = KillSwitch(
-                max_drawdown_pct=self.settings.MAX_DRAWDOWN_PCT,
-                account_info=self._account_info
+                order_manager=self._order_manager
             )
 
             # Create position sizer
-            self._position_sizer = PositionSizer(
-                account_info=self._account_info,
-                risk_per_trade_pct=self.settings.RISK_PER_TRADE_PCT
-            )
+            self._position_sizer = PositionSizer()
 
             # Create risk manager
             self._risk_manager = RiskManager(
@@ -312,7 +311,24 @@ class TradingEngine:
         CALLED BY: start()
         """
         try:
-            # Strategy B (always active in Phase 1)
+            # Strategy A — Trend Following
+            strategy_a = StrategyA(
+                data_feed=self._data_feed,
+                order_manager=self._order_manager,
+                event_bus=self._event_bus,
+                config={
+                    'timeframe': 'H1',
+                    'lookback': 200,
+                    'default_lots': 1.0,
+                    'ema_fast': 20,
+                    'ema_slow': 50,
+                    'adx_threshold': 25,
+                }
+            )
+            strategy_a.start()
+            self._strategies['A'] = strategy_a
+
+            # Strategy B — Mean Reversion Grid
             strategy_b = StrategyB(
                 data_feed=self._data_feed,
                 order_manager=self._order_manager,
@@ -327,6 +343,37 @@ class TradingEngine:
             )
             strategy_b.start()
             self._strategies['B'] = strategy_b
+
+            # Strategy C — Session Breakout
+            strategy_c = StrategyC(
+                data_feed=self._data_feed,
+                order_manager=self._order_manager,
+                event_bus=self._event_bus,
+                config={
+                    'timeframe': 'M15',
+                    'lookback': 100,
+                    'default_lots': 1.0,
+                    'breakout_lookback': 20,
+                }
+            )
+            strategy_c.start()
+            self._strategies['C'] = strategy_c
+
+            # Strategy D — Volatility Harvester
+            strategy_d = StrategyD(
+                data_feed=self._data_feed,
+                order_manager=self._order_manager,
+                event_bus=self._event_bus,
+                config={
+                    'timeframe': 'H1',
+                    'lookback': 100,
+                    'default_lots': 1.0,
+                    'bb_period': 20,
+                    'bb_std': 2.0,
+                }
+            )
+            strategy_d.start()
+            self._strategies['D'] = strategy_d
 
             logger.info("strategies_registered", strategies=list(self._strategies.keys()))
 

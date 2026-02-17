@@ -89,7 +89,7 @@ export function EquityChart({ data = mockData, loading = false }: EquityChartPro
           <YAxis
             tick={{ fill: '#9CA3AF', fontSize: 12 }}
             stroke="#4B5563"
-            domain="dataMin"
+            domain={['dataMin', 'dataMax']}
             tickFormatter={(value) => `$${(value / 1000).toFixed(0)}k`}
           />
           <Tooltip content={<CustomTooltip />} />
