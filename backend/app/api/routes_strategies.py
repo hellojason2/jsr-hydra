@@ -29,7 +29,6 @@ router = APIRouter(prefix="/strategies", tags=["strategies"])
 
 @router.get("", response_model=list[StrategyResponse])
 async def list_strategies(
-    current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[StrategyResponse]:
     """
@@ -70,7 +69,6 @@ async def list_strategies(
 @router.get("/{strategy_code}", response_model=StrategyResponse)
 async def get_strategy(
     strategy_code: str,
-    current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> StrategyResponse:
     """

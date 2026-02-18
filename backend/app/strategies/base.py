@@ -350,7 +350,7 @@ class BaseStrategy(ABC):
         """
         try:
             # Fetch latest candles for analysis
-            candles_df = self._data_feed.get_candles(
+            candles_df = await self._data_feed.get_candles(
                 symbol=symbol,
                 timeframe=self._config.get('timeframe', 'H1'),
                 count=self._config.get('lookback', 50)
@@ -388,7 +388,7 @@ class BaseStrategy(ABC):
             trade_create = TradeCreate(
                 symbol=symbol,
                 direction=signal.direction,
-                lots=self._config.get('default_lots', 1.0),
+                lots=self._config.get('default_lots', 0.01),
                 entry_price=candles_df['close'].iloc[-1],
                 stop_loss=signal.sl_price,
                 take_profit=signal.tp_price,

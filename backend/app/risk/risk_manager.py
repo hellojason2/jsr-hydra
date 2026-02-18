@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from app.bridge.account_info import AccountInfo
-from app.config.constants import DailyLossLimitPct
+from app.config.constants import DailyLossLimitPct, MAX_TEST_LOTS
 from app.config.settings import settings
 from app.events.bus import get_event_bus
 from app.utils.logger import get_logger
@@ -143,8 +143,8 @@ class RiskManager:
                     **result_dict
                 )
 
-                equity = self._account_info.get_equity()
-                drawdown = self._calculate_drawdown()
+                equity = await self._account_info.get_equity()
+                drawdown = await self._calculate_drawdown()
 
                 return RiskCheckResult(
                     approved=False,
@@ -157,9 +157,9 @@ class RiskManager:
 
             # Get account info
             try:
-                equity = self._account_info.get_equity()
-                balance = self._account_info.get_balance()
-                margin_level = self._account_info.get_margin_level()
+                equity = await self._account_info.get_equity()
+                balance = await self._account_info.get_balance()
+                margin_level = await self._account_info.get_margin_level()
             except Exception as e:
                 logger.error(
                     "pre_trade_check_account_info_failed",
@@ -185,7 +185,7 @@ class RiskManager:
                     **result_dict
                 )
 
-                drawdown = self._calculate_drawdown()
+                drawdown = await self._calculate_drawdown()
 
                 return RiskCheckResult(
                     approved=False,
@@ -210,7 +210,7 @@ class RiskManager:
                         reason="Stop-loss distance required for position sizing",
                         risk_score=50.0,
                         position_size=0.0,
-                        drawdown_pct=self._calculate_drawdown(),
+                        drawdown_pct=await self._calculate_drawdown(),
                         daily_pnl=self._daily_pnl
                     )
 
@@ -232,11 +232,21 @@ class RiskManager:
                         reason=f"Position sizing failed: {str(e)}",
                         risk_score=50.0,
                         position_size=0.0,
-                        drawdown_pct=self._calculate_drawdown(),
+                        drawdown_pct=await self._calculate_drawdown(),
                         daily_pnl=self._daily_pnl
                     )
             else:
                 position_size = requested_lots
+
+            # Cap position size at MAX_TEST_LOTS for safety
+            if position_size > MAX_TEST_LOTS:
+                logger.info(
+                    "position_size_capped",
+                    original=position_size,
+                    capped_to=MAX_TEST_LOTS,
+                    **result_dict
+                )
+                position_size = MAX_TEST_LOTS
 
             # Validate position size
             if not self._position_sizer.validate_position_size(position_size, symbol):
@@ -254,13 +264,13 @@ class RiskManager:
                             f"{self._position_sizer.get_max_lots()}]",
                     risk_score=60.0,
                     position_size=position_size,
-                    drawdown_pct=self._calculate_drawdown(),
+                    drawdown_pct=await self._calculate_drawdown(),
                     daily_pnl=self._daily_pnl
                 )
 
-            # 4. Check margin level
-            min_margin_level = 150.0  # Require at least 150% margin
-            if margin_level < min_margin_level:
+            # 4. Check margin level (0 means no positions open = safe)
+            min_margin_level = 120.0  # Require at least 120% margin
+            if margin_level > 0 and margin_level < min_margin_level:
                 logger.warning(
                     "pre_trade_check_rejected_low_margin",
                     margin_level=margin_level,
@@ -272,7 +282,7 @@ class RiskManager:
                     reason=f"Margin level too low: {margin_level:.1f}% (minimum: {min_margin_level}%)",
                     risk_score=75.0,
                     position_size=position_size,
-                    drawdown_pct=self._calculate_drawdown(),
+                    drawdown_pct=await self._calculate_drawdown(),
                     daily_pnl=self._daily_pnl
                 )
 
@@ -288,12 +298,12 @@ class RiskManager:
                         reason="Trading disabled on weekends (except crypto/commodities)",
                         risk_score=10.0,
                         position_size=position_size,
-                        drawdown_pct=self._calculate_drawdown(),
+                        drawdown_pct=await self._calculate_drawdown(),
                         daily_pnl=self._daily_pnl
                     )
 
             # All checks passed
-            drawdown = self._calculate_drawdown()
+            drawdown = await self._calculate_drawdown()
             risk_score = self._calculate_risk_score(drawdown, margin_level, daily_loss_pct)
 
             logger.info(
@@ -360,8 +370,8 @@ class RiskManager:
                 self._daily_pnl_reset_time = self._get_utc_midnight()
 
             try:
-                equity = self._account_info.get_equity()
-                margin_level = self._account_info.get_margin_level()
+                equity = await self._account_info.get_equity()
+                margin_level = await self._account_info.get_margin_level()
             except Exception as e:
                 logger.error(
                     "get_risk_metrics_account_info_failed",
@@ -370,8 +380,9 @@ class RiskManager:
                 equity = 0.0
                 margin_level = 0.0
 
-            drawdown = self._calculate_drawdown()
-            daily_limit_hit = (abs(min(0, self._daily_pnl)) / self._account_info.get_balance()) * 100.0 >= settings.DAILY_LOSS_LIMIT_PCT
+            drawdown = await self._calculate_drawdown()
+            balance = await self._account_info.get_balance()
+            daily_limit_hit = (abs(min(0, self._daily_pnl)) / balance) * 100.0 >= settings.DAILY_LOSS_LIMIT_PCT if balance > 0 else False
 
             metrics = RiskMetrics(
                 drawdown_pct=drawdown,
@@ -392,7 +403,7 @@ class RiskManager:
 
             return metrics
 
-    def _calculate_drawdown(self) -> float:
+    async def _calculate_drawdown(self) -> float:
         """
         PURPOSE: Calculate current drawdown from peak equity.
 
@@ -400,8 +411,8 @@ class RiskManager:
             float: Drawdown percentage (0.0 if at peak).
         """
         try:
-            equity = self._account_info.get_equity()
-            balance = self._account_info.get_balance()
+            equity = await self._account_info.get_equity()
+            balance = await self._account_info.get_balance()
 
             if balance <= 0:
                 return 0.0
@@ -453,13 +464,15 @@ class RiskManager:
 
     def _is_weekend(self) -> bool:
         """
-        PURPOSE: Check if current UTC time is on weekend.
+        PURPOSE: Check if forex market is in weekend closure.
+
+        Forex weekend: Friday 22:00 UTC to Sunday 22:00 UTC.
 
         Returns:
-            bool: True if Saturday or Sunday (UTC).
+            bool: True if in weekend closure period.
         """
-        now = datetime.utcnow()
-        return now.weekday() >= 5  # 5=Saturday, 6=Sunday
+        from app.utils.time_utils import is_weekend
+        return is_weekend()
 
     def _is_weekend_safe_symbol(self, symbol: str) -> bool:
         """

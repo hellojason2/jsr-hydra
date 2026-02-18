@@ -75,7 +75,7 @@ class StrategyB(BaseStrategy):
         self._grid_levels = config.get('grid_levels', 5)
         self._grid_spacing_pct = config.get('grid_spacing_pct', 0.5)
         self._lookback = config.get('lookback', 50)
-        self._z_score_threshold = config.get('z_score_threshold', 2.0)
+        self._z_score_threshold = config.get('z_score_threshold', 1.3)
         self._timeframe = config.get('timeframe', 'H1')
         self._default_lots = config.get('default_lots', 1.0)
 

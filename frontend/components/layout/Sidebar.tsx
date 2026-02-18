@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
   LayoutDashboard,
+  Brain,
   TrendingUp,
   ArrowLeftRight,
   Shield,
@@ -15,6 +16,7 @@ import {
 
 const navItems = [
   { href: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+  { href: '/dashboard/brain', icon: Brain, label: 'Brain', accent: true },
   { href: '/dashboard/strategies', icon: TrendingUp, label: 'Strategies' },
   { href: '/dashboard/trades', icon: ArrowLeftRight, label: 'Trades' },
   { href: '/dashboard/risk', icon: Shield, label: 'Risk' },
@@ -54,7 +56,7 @@ export default function Sidebar() {
 
       {/* Sidebar */}
       <aside
-        className={`fixed left-0 top-0 z-40 h-screen w-64 bg-brand-panel border-r border-gray-700 p-6 transition-transform duration-300 md:static md:translate-x-0 ${
+        className={`fixed left-0 top-0 z-40 h-screen w-64 shrink-0 bg-brand-panel border-r border-gray-700 p-6 transition-transform duration-300 md:static md:translate-x-0 ${
           isOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -76,6 +78,7 @@ export default function Sidebar() {
           {navItems.map((item) => {
             const Icon = item.icon
             const active = isActive(item.href)
+            const isAccent = 'accent' in item && item.accent
 
             return (
               <Link
@@ -84,7 +87,11 @@ export default function Sidebar() {
                 onClick={() => setIsOpen(false)}
                 className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-all duration-200 ${
                   active
-                    ? 'bg-gray-700 text-brand-accent-green'
+                    ? isAccent
+                      ? 'bg-purple-500/15 text-purple-400 border border-purple-500/20'
+                      : 'bg-gray-700 text-brand-accent-green'
+                    : isAccent
+                    ? 'text-purple-300/70 hover:text-purple-300 hover:bg-purple-500/10'
                     : 'text-gray-400 hover:text-gray-100 hover:bg-gray-800'
                 }`}
               >

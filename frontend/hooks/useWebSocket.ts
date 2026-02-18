@@ -12,7 +12,12 @@ import {
 import { useLiveStore } from "../store/useLiveStore";
 import { useAppStore } from "../store/useAppStore";
 import { LiveUpdate } from "../lib/types";
-import { BASE_URL } from "../lib/api";
+// Derive the WebSocket base URL from the browser's current origin,
+// converting http(s) to ws(s). This ensures it goes through Caddy.
+function getWsBaseUrl(): string {
+  if (typeof window === "undefined") return "ws://localhost:8000";
+  return window.location.origin.replace(/^http/, "ws");
+}
 
 interface UseWebSocketResult {
   status: "connecting" | "connected" | "disconnected";
@@ -50,7 +55,7 @@ export function useWebSocket(): UseWebSocketResult {
     }
 
     // Construct WebSocket URL
-    const wsUrl = `${BASE_URL.replace(/^http/, "ws")}/api/ws/live`;
+    const wsUrl = `${getWsBaseUrl()}/api/ws/live`;
 
     // Create or reuse WebSocket client
     if (!wsRef.current) {
@@ -120,7 +125,7 @@ export function useWebSocketClient(): WebSocketClient | null {
 
   useEffect(() => {
     if (isAuthenticated) {
-      const wsUrl = `${BASE_URL.replace(/^http/, "ws")}/api/ws/live`;
+      const wsUrl = `${getWsBaseUrl()}/api/ws/live`;
       if (!wsRef.current) {
         wsRef.current = createWebSocketClient({
           url: wsUrl,

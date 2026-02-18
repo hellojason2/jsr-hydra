@@ -36,7 +36,6 @@ async def list_trades(
     strategy_filter: Optional[str] = Query(None, description="Filter by strategy code"),
     symbol_filter: Optional[str] = Query(None, description="Filter by symbol"),
     days_ago: Optional[int] = Query(None, ge=0, description="Trades from last N days"),
-    current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TradeList:
     """
@@ -65,7 +64,7 @@ async def list_trades(
         filters = []
 
         if status_filter:
-            filters.append(Trade.status == status_filter)
+            filters.append(Trade.status == status_filter.upper())
 
         if strategy_filter:
             from app.models.strategy import Strategy
@@ -132,7 +131,6 @@ async def list_trades(
 @router.get("/{trade_id}", response_model=TradeResponse)
 async def get_trade(
     trade_id: str,
-    current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TradeResponse:
     """
@@ -208,17 +206,38 @@ async def create_trade(
         HTTPException: If trade creation fails or validation error
     """
     try:
-        # Create trade instance from schema
+        from app.models.strategy import Strategy
+        from app.models.account import MasterAccount
+
+        # Get or create master account for API trades
+        stmt = select(MasterAccount).limit(1)
+        result = await db.execute(stmt)
+        master = result.scalar_one_or_none()
+        if not master:
+            master = MasterAccount(mt5_login=0, broker="API", status="RUNNING")
+            db.add(master)
+            await db.flush()
+
+        # Resolve strategy_code to strategy_id
+        strategy_id = None
+        if trade_data.strategy_code:
+            stmt = select(Strategy).where(Strategy.code == trade_data.strategy_code)
+            result = await db.execute(stmt)
+            strategy = result.scalar_one_or_none()
+            if strategy:
+                strategy_id = strategy.id
+
         new_trade = Trade(
+            master_id=master.id,
+            strategy_id=strategy_id,
             symbol=trade_data.symbol,
-            direction=trade_data.direction,
+            direction=trade_data.direction.upper(),
             lots=trade_data.lots,
             entry_price=trade_data.entry_price,
             stop_loss=trade_data.stop_loss,
             take_profit=trade_data.take_profit,
-            strategy_code=trade_data.strategy_code,
             reason=trade_data.reason,
-            status="open",
+            status="OPEN",
             profit=0.0,
             commission=0.0,
             swap=0.0,
@@ -262,7 +281,6 @@ async def create_trade(
 async def get_trade_stats(
     days_ago: Optional[int] = Query(None, ge=0, description="Stats for last N days"),
     strategy_filter: Optional[str] = Query(None, description="Filter by strategy code"),
-    current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TradeStats:
     """
@@ -284,7 +302,7 @@ async def get_trade_stats(
     """
     try:
         # Build filters
-        filters = [Trade.status == "closed"]
+        filters = [Trade.status == "CLOSED"]
 
         if days_ago is not None:
             cutoff_date = datetime.utcnow() - timedelta(days=days_ago)

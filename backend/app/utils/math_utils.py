@@ -7,6 +7,56 @@ import numpy as np
 from typing import List, Dict, Optional
 
 
+def pip_size(symbol: str) -> float:
+    """
+    PURPOSE: Return the pip size for a given trading symbol.
+
+    XAUUSD: 0.01 (gold is quoted to 2 decimal places)
+    JPY pairs: 0.01 (USDJPY, EURJPY, GBPJPY, etc.)
+    All other forex: 0.0001 (standard 4/5-decimal pairs)
+
+    Args:
+        symbol: Trading symbol (e.g., "XAUUSD", "EURUSD", "USDJPY").
+
+    Returns:
+        float: Pip size for the symbol.
+    """
+    sym = symbol.upper()
+    if sym == "XAUUSD":
+        return 0.01
+    if "JPY" in sym:
+        return 0.01
+    return 0.0001
+
+
+def pip_value(symbol: str, lots: float) -> float:
+    """
+    PURPOSE: Calculate approximate dollar value per pip for a given lot size.
+
+    Standard lot = 100,000 units of base currency.
+    - For most USD-quoted pairs (EURUSD, GBPUSD): 1 pip = $10 per standard lot.
+    - For JPY pairs (USDJPY, EURJPY): 1 pip ~ $6.67 per standard lot (approx).
+    - For XAUUSD: 1 pip (0.01) on 1 lot (100 oz) = $1.00.
+
+    Args:
+        symbol: Trading symbol.
+        lots: Position size in lots.
+
+    Returns:
+        float: Approximate dollar value per pip movement.
+    """
+    sym = symbol.upper()
+    if sym == "XAUUSD":
+        # 1 lot = 100 oz, 1 pip = 0.01 → value = 100 * 0.01 = $1.00 per lot
+        return lots * 1.0
+    if "JPY" in sym:
+        # Approximate: 1 pip = 0.01, 1 lot = 100k units, ~$6.67 per std lot
+        return lots * 6.67
+    # Standard forex pairs quoted vs USD
+    # 1 pip = 0.0001, 1 lot = 100k units → $10 per std lot
+    return lots * 10.0
+
+
 def round_lots(lots: float, step: float = 0.01) -> float:
     """
     PURPOSE: Round lot size to the nearest step increment.

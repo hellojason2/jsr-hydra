@@ -99,6 +99,42 @@ async def handle_system_event(payload: EventPayload) -> None:
         # await notify_alert(f"{payload.event_type}: {payload.data}")
 
 
+async def handle_trade_closed_update_strategy(payload: EventPayload) -> None:
+    """
+    Update strategy performance metrics when a trade closes.
+
+    PURPOSE: Recalculate win_rate, profit_factor, total_trades after each closed trade.
+
+    CALLED BY: EventBus on TRADE_CLOSED event.
+    """
+    logger = get_logger("events.handlers")
+
+    try:
+        trade_data = payload.data
+        strategy_code = trade_data.get("strategy_code")
+
+        if not strategy_code:
+            return
+
+        from app.db.engine import AsyncSessionLocal
+        from app.services.strategy_service import StrategyService
+        from app.models.trade import Trade
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            # Get the trade
+            trade_id = trade_data.get("trade_id")
+            if trade_id:
+                stmt = select(Trade).where(Trade.id == trade_id)
+                result = await session.execute(stmt)
+                trade = result.scalar_one_or_none()
+                if trade:
+                    await StrategyService.update_strategy_performance(session, strategy_code, trade)
+                    logger.info("strategy_performance_updated_from_event", strategy_code=strategy_code)
+    except Exception as e:
+        logger.error("handle_trade_closed_update_strategy_error", error=str(e))
+
+
 def register_all_handlers(bus) -> None:
     """
     Wire up all event handlers to the event bus.
@@ -119,6 +155,7 @@ def register_all_handlers(bus) -> None:
     # Trade event handlers
     bus.on("TRADE_OPENED", handle_trade_event)
     bus.on("TRADE_CLOSED", handle_trade_event)
+    bus.on("TRADE_CLOSED", handle_trade_closed_update_strategy)
     bus.on("TRADE_MODIFIED", handle_trade_event)
 
     # Regime event handlers

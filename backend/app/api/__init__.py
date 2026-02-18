@@ -11,6 +11,7 @@ from app.api.auth import router as auth_router
 from app.api.routes_trades import router as trades_router
 from app.api.routes_strategies import router as strategies_router
 from app.api.routes_system import router as system_router
+from app.api.routes_brain import router as brain_router
 
 # Create the main API router
 api_router = APIRouter(prefix="/api", tags=["api"])
@@ -20,5 +21,6 @@ api_router.include_router(auth_router, tags=["auth"])
 api_router.include_router(trades_router, tags=["trades"])
 api_router.include_router(strategies_router, tags=["strategies"])
 api_router.include_router(system_router, tags=["system"])
+api_router.include_router(brain_router, tags=["brain"])
 
 __all__ = ["api_router"]

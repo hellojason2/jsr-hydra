@@ -136,6 +136,9 @@ MaxDrawdownPct: float = 15.0
 # Daily loss limit percentage
 DailyLossLimitPct: float = 5.0
 
+# Maximum lot size for testing/live (safety cap)
+MAX_TEST_LOTS: float = 0.01
+
 # Supported trading symbols
 SUPPORTED_SYMBOLS: list[str] = ["XAUUSD", "BTCUSD", "EURUSD"]
 

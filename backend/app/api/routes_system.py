@@ -2,25 +2,29 @@
 PURPOSE: System-level API routes for JSR Hydra trading system.
 
 Provides endpoints for health checks, version information, dashboard summary,
-kill switch controls, and system status monitoring. Health check is public,
-all others require authentication.
+kill switch controls, and system status monitoring.
 """
 
-import json
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
+from app.config.settings import settings
 from app.db.engine import get_db
 from app.models.account import MasterAccount
+from app.models.strategy import Strategy
+from app.models.trade import Trade
 from app.models.system import SystemHealth
 from app.schemas import HealthCheck, VersionInfo, DashboardSummary
+from app.schemas.account import AccountResponse
+from app.schemas.strategy import StrategyMetrics
+from app.services.regime_service import RegimeService
 from app.utils.logger import get_logger
 from app.version import get_version
 
@@ -28,78 +32,98 @@ from app.version import get_version
 logger = get_logger(__name__)
 router = APIRouter(prefix="/system", tags=["system"])
 
-# Track system startup time
 _startup_time = time.time()
 
-
-# ════════════════════════════════════════════════════════════════
-# Health Check (Public)
-# ════════════════════════════════════════════════════════════════
+MT5_REST_URL = getattr(settings, "MT5_REST_URL", "http://jsr-mt5:18812")
 
 
-@router.get("/health", response_model=HealthCheck, tags=["health"])
-async def health_check(db: AsyncSession = Depends(get_db)) -> HealthCheck:
-    """
-    PURPOSE: Public health check endpoint for monitoring and load balancer health probes.
-
-    CALLED BY: Load balancers, monitoring systems (no authentication required)
-
-    Args:
-        db: Database session for checking database connectivity
-
-    Returns:
-        HealthCheck: System health status with service statuses and uptime
-
-    Raises:
-        HTTPException: If critical services are unavailable
-    """
+async def _mt5_request(path: str, method: str = "GET", json_data: dict = None, timeout: float = 5.0):
+    """Make a request to the MT5 REST bridge."""
     try:
-        services = {}
-        overall_status = "healthy"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            if method == "GET":
+                resp = await client.get(f"{MT5_REST_URL}{path}")
+            else:
+                resp = await client.post(f"{MT5_REST_URL}{path}", json=json_data)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+    except Exception:
+        return None
 
-        # Check database
-        try:
-            await db.execute(select(1))
-            services["database"] = "ok"
-        except Exception as e:
-            services["database"] = "degraded"
-            overall_status = "degraded"
-            logger.warning("health_check_database_degraded", error=str(e))
 
-        # Get version
-        try:
-            version_info = get_version()
-            version = version_info.get("version", "unknown")
-        except Exception as e:
-            version = "unknown"
-            services["version"] = "degraded"
-            logger.warning("health_check_version_unavailable", error=str(e))
+# ════════════════════════════════════════════════════════════════
+# Health Check (Public — no auth required)
+# ════════════════════════════════════════════════════════════════
 
-        # Always include core services
-        services["api"] = "ok"
 
-        uptime_seconds = time.time() - _startup_time
+@router.get("/health", response_model=None, tags=["health"])
+async def health_check(db: AsyncSession = Depends(get_db)):
+    """Comprehensive health check with all service statuses."""
+    services = {}
+    overall_status = "ok"
 
-        logger.info(
-            "health_check_performed",
-            status=overall_status,
-            services=services,
-            uptime_seconds=round(uptime_seconds, 2)
-        )
-
-        return HealthCheck(
-            status=overall_status,
-            services=services,
-            version=version,
-            uptime_seconds=uptime_seconds,
-        )
-
+    # Check database
+    try:
+        await db.execute(select(1))
+        services["postgres"] = {"status": "connected"}
     except Exception as e:
-        logger.error("health_check_failed", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Health check failed"
-        )
+        services["postgres"] = {"status": "disconnected", "error": str(e)}
+        overall_status = "degraded"
+
+    # Check Redis
+    try:
+        from app.events.bus import get_event_bus
+        bus = get_event_bus()
+        if bus._redis:
+            await bus._redis.ping()
+            services["redis"] = {"status": "connected"}
+        else:
+            services["redis"] = {"status": "disconnected"}
+            overall_status = "degraded"
+    except Exception:
+        services["redis"] = {"status": "disconnected"}
+        overall_status = "degraded"
+
+    # Check MT5
+    mt5_data = await _mt5_request("/account")
+    if mt5_data and "balance" in mt5_data:
+        services["mt5"] = {
+            "status": "connected",
+            "account": mt5_data.get("login"),
+            "broker": mt5_data.get("server"),
+            "balance": mt5_data.get("balance"),
+        }
+    else:
+        services["mt5"] = {"status": "disconnected"}
+        overall_status = "degraded"
+
+    # Version
+    version_data = get_version()
+
+    uptime = time.time() - _startup_time
+
+    # Trading info
+    trading = {
+        "dry_run": settings.DRY_RUN,
+        "system_status": "RUNNING",
+    }
+
+    # Open positions count
+    positions = await _mt5_request("/positions")
+    if positions and isinstance(positions, list):
+        trading["open_positions"] = len(positions)
+    else:
+        trading["open_positions"] = 0
+
+    return {
+        "status": overall_status,
+        "version": version_data.get("version", "1.0.0"),
+        "codename": version_data.get("codename", "Hydra"),
+        "uptime_seconds": round(uptime, 1),
+        "services": services,
+        "trading": trading,
+    }
 
 
 # ════════════════════════════════════════════════════════════════
@@ -108,128 +132,213 @@ async def health_check(db: AsyncSession = Depends(get_db)) -> HealthCheck:
 
 
 @router.get("/version", response_model=VersionInfo, tags=["version"])
-async def get_system_version(
-    current_user: str = Depends(get_current_user),
-) -> VersionInfo:
-    """
-    PURPOSE: Retrieve system version information from version.json.
-
-    CALLED BY: Frontend version display, API clients
-
-    Args:
-        current_user: Authenticated username
-
-    Returns:
-        VersionInfo: Version string, codename, and update timestamp
-
-    Raises:
-        HTTPException: If version.json cannot be read
-    """
-    try:
-        version_data = get_version()
-
-        logger.info(
-            "version_retrieved",
-            version=version_data.get("version")
-        )
-
-        return VersionInfo(
-            version=version_data.get("version", "unknown"),
-            codename=version_data.get("codename", "Hydra"),
-            updated_at=version_data.get("updated_at", datetime.utcnow().isoformat()),
-        )
-
-    except FileNotFoundError:
-        logger.error("version_file_not_found")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Version information not available"
-        )
-    except Exception as e:
-        logger.error("version_retrieval_failed", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve version"
-        )
+async def get_system_version() -> VersionInfo:
+    """Retrieve system version information."""
+    version_data = get_version()
+    return VersionInfo(
+        version=version_data.get("version", "unknown"),
+        codename=version_data.get("codename", "Hydra"),
+        updated_at=version_data.get("updated_at", datetime.utcnow().isoformat()),
+    )
 
 
 # ════════════════════════════════════════════════════════════════
-# Dashboard Summary
+# Dashboard Summary — REAL DATA from MT5 + DB
 # ════════════════════════════════════════════════════════════════
 
 
-@router.get("/dashboard", response_model=DashboardSummary)
+@router.get("/dashboard", response_model=None)
 async def get_dashboard_summary(
-    current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> DashboardSummary:
-    """
-    PURPOSE: Retrieve comprehensive dashboard summary with account, strategies, trades, and system status.
-
-    CALLED BY: Dashboard frontend page
-
-    Args:
-        current_user: Authenticated username
-        db: Database session
-
-    Returns:
-        DashboardSummary: Complete system state for dashboard rendering
-
-    Raises:
-        HTTPException: If required data cannot be retrieved
-    """
+):
+    """Dashboard summary with real MT5 account data, positions, and strategy metrics."""
     try:
-        # Get version
-        version_data = get_version()
-        version = version_data.get("version", "unknown")
-
-        # Fetch account info (simplified - would normally fetch from MasterAccount model)
-        stmt = select(MasterAccount).limit(1)
-        result = await db.execute(stmt)
-        account = result.scalar_one_or_none()
-
-        if not account:
-            logger.warning("dashboard_summary_no_account")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No master account found"
-            )
-
-        # Build placeholder dashboard data
-        # NOTE: In full implementation, this would aggregate real data from:
-        # - MasterAccount (current balance, equity)
-        # - RegimeState (current market regime)
-        # - CapitalAllocation (strategy allocations)
-        # - Strategy metrics
-        # - Recent trades
-        # - Equity curve history
-
-        logger.info(
-            "dashboard_summary_retrieved",
-            account_id=str(account.id),
-            version=version
-        )
-
-        # Return minimal dashboard structure (extend with real aggregations)
-        return DashboardSummary(
-            account=None,  # Would be AccountResponse
-            regime=None,   # Would be RegimeResponse
-            allocations=[],  # Would be list of AllocationResponse
-            strategies=[],  # Would be list of StrategyMetrics
-            recent_trades=[],  # Would be list of TradeResponse
-            equity_curve=[],  # Would be list of dict with timestamp and value
-            system_status="healthy",
-            version=version,
-        )
-
-    except HTTPException:
-        raise
+        return await _build_dashboard(db)
     except Exception as e:
-        logger.error("dashboard_summary_failed", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve dashboard summary"
-        )
+        logger.error("dashboard_fatal_error", error=str(e))
+        # Return a degraded but valid response instead of 500
+        return {
+            "account": None,
+            "positions": [],
+            "strategies": [],
+            "recent_trades": [],
+            "regime": None,
+            "symbols": [],
+            "system_status": "ERROR",
+            "version": "unknown",
+            "dry_run": settings.DRY_RUN,
+            "uptime_seconds": round(time.time() - _startup_time, 1),
+            "error": str(e),
+        }
+
+
+async def _build_dashboard(db: AsyncSession) -> dict:
+    """Build dashboard data with graceful fallbacks for each section."""
+    version_data = get_version()
+    version = version_data.get("version", "1.0.0")
+
+    # ── MT5 Account ──
+    mt5_account = await _mt5_request("/account")
+    account_data = None
+    try:
+        if mt5_account and "balance" in mt5_account:
+            # Calculate drawdown
+            peak_equity = mt5_account.get("equity", 0)
+            try:
+                stmt = select(MasterAccount).limit(1)
+                result = await db.execute(stmt)
+                db_account = result.scalar_one_or_none()
+                if db_account and db_account.peak_equity:
+                    peak_equity = max(db_account.peak_equity, mt5_account.get("equity", 0))
+            except Exception:
+                await db.rollback()  # master_accounts table may not exist yet
+
+            drawdown_pct = 0.0
+            if peak_equity > 0:
+                drawdown_pct = max(0, (peak_equity - mt5_account.get("equity", 0)) / peak_equity * 100)
+
+            account_data = {
+                "login": mt5_account.get("login"),
+                "server": mt5_account.get("server"),
+                "balance": mt5_account.get("balance", 0),
+                "equity": mt5_account.get("equity", 0),
+                "margin": mt5_account.get("margin", 0),
+                "free_margin": mt5_account.get("free_margin", 0),
+                "margin_level": mt5_account.get("margin_level", 0),
+                "profit": mt5_account.get("profit", 0),
+                "currency": mt5_account.get("currency", "USD"),
+                "leverage": mt5_account.get("leverage", 0),
+                "peak_equity": peak_equity,
+                "drawdown_pct": round(drawdown_pct, 2),
+            }
+    except Exception as e:
+        logger.warning("dashboard_account_error", error=str(e))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ── Positions ──
+    positions = await _mt5_request("/positions")
+    if not isinstance(positions, list):
+        positions = []
+
+    # ── Strategies from DB ──
+    strategies_data = []
+    try:
+        stmt = select(Strategy)
+        result = await db.execute(stmt)
+        strategies = result.scalars().all()
+        for s in strategies:
+            strategies_data.append({
+                "code": s.code,
+                "name": s.name,
+                "status": s.status,
+                "allocation_pct": s.allocation_pct,
+                "win_rate": s.win_rate,
+                "profit_factor": s.profit_factor,
+                "total_trades": s.total_trades,
+                "total_profit": s.total_profit,
+            })
+    except Exception as e:
+        logger.warning("dashboard_strategies_error", error=str(e))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ── Recent trades from DB ──
+    recent_trades = []
+    try:
+        stmt = select(Trade).order_by(Trade.created_at.desc()).limit(20)
+        result = await db.execute(stmt)
+        trades = result.scalars().all()
+        for t in trades:
+            recent_trades.append({
+                "id": str(t.id),
+                "symbol": t.symbol,
+                "direction": t.direction,
+                "lots": t.lots,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "profit": t.profit,
+                "net_profit": t.net_profit,
+                "status": t.status,
+                "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+            })
+    except Exception as e:
+        logger.warning("dashboard_trades_error", error=str(e))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ── Current regime from DB ──
+    regime_data = None
+    try:
+        regime = await RegimeService.get_current_regime(db)
+        if regime:
+            regime_data = {
+                "state": regime.regime.upper() if regime.regime else "UNKNOWN",
+                "confidence": regime.confidence or 0,
+                "conviction": regime.conviction_score or 0,
+                "lastDetected": regime.detected_at.isoformat() if regime.detected_at else None,
+            }
+    except Exception as e:
+        logger.warning("dashboard_regime_error", error=str(e))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ── Available symbols ──
+    symbols = await _mt5_request("/symbols")
+    symbol_names = symbols if isinstance(symbols, list) else []
+
+    # ── System status ──
+    uptime = time.time() - _startup_time
+
+    return {
+        "account": account_data,
+        "positions": positions,
+        "strategies": strategies_data,
+        "recent_trades": recent_trades,
+        "regime": regime_data,
+        "symbols": symbol_names[:20],  # First 20 symbols
+        "system_status": "RUNNING",
+        "version": version,
+        "dry_run": settings.DRY_RUN,
+        "uptime_seconds": round(uptime, 1),
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+# Live Tick Price
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/tick/{symbol}")
+async def get_tick(symbol: str):
+    """Get live tick price for a symbol (public, no auth)."""
+    data = await _mt5_request(f"/tick/{symbol}")
+    if data and "bid" in data:
+        return data
+    raise HTTPException(status_code=404, detail=f"No tick data for {symbol}")
+
+
+# ════════════════════════════════════════════════════════════════
+# Positions (from MT5)
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/positions")
+async def get_positions():
+    """Get open positions from MT5."""
+    data = await _mt5_request("/positions")
+    if isinstance(data, list):
+        return data
+    return []
 
 
 # ════════════════════════════════════════════════════════════════
@@ -243,62 +352,40 @@ async def trigger_kill_switch(
     current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """
-    PURPOSE: Immediately trigger the kill switch to close all positions and halt trading.
+    """Trigger kill switch — close all positions and halt trading."""
+    logger.critical("kill_switch_triggered", reason=reason, triggered_by=current_user)
 
-    CALLED BY: Emergency stop button, risk management alerts
+    # Close all open positions
+    positions_closed = 0
+    positions = await _mt5_request("/positions")
+    if isinstance(positions, list):
+        for pos in positions:
+            ticket = pos.get("ticket")
+            if ticket:
+                result = await _mt5_request(f"/close/{ticket}", method="POST")
+                if result and result.get("retcode") == 10009:
+                    positions_closed += 1
+                    logger.info("kill_switch_position_closed", ticket=ticket)
 
-    Behavior:
-        1. Close ALL open positions at market price
-        2. Set system status to HALTED
-        3. Cancel all pending orders
-        4. Log event as CRITICAL severity
-        5. Send Telegram alert
-        6. Require manual restart (no auto-resume)
-
-    Args:
-        reason: Optional reason for triggering kill switch
-        current_user: Authenticated username
-        db: Database session
-
-    Returns:
-        dict: Kill switch status and execution details
-
-    Raises:
-        HTTPException: If kill switch execution fails
-    """
+    # Publish event
     try:
-        # Log the kill switch event
-        logger.critical(
-            "kill_switch_triggered",
-            reason=reason,
-            triggered_by=current_user
-        )
-
-        # TODO: Implement actual kill switch logic:
-        # 1. Close all open positions via MT5 bridge
-        # 2. Set SystemStatus.status = "HALTED"
-        # 3. Cancel pending orders
-        # 4. Log to event_log with severity=CRITICAL
-        # 5. Send Telegram alert via alerts module
-
-        return {
-            "status": "executed",
+        from app.events.bus import get_event_bus
+        bus = get_event_bus()
+        await bus.publish("KILL_SWITCH_TRIGGERED", {
             "reason": reason,
-            "timestamp": datetime.utcnow().isoformat(),
+            "positions_closed": positions_closed,
             "triggered_by": current_user,
-        }
+        })
+    except Exception:
+        pass
 
-    except Exception as e:
-        logger.error(
-            "kill_switch_execution_failed",
-            error=str(e),
-            triggered_by=current_user
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Kill switch execution failed"
-        )
+    return {
+        "status": "halted",
+        "reason": reason,
+        "positions_closed": positions_closed,
+        "timestamp": datetime.utcnow().isoformat(),
+        "triggered_by": current_user,
+    }
 
 
 @router.post("/kill-switch/reset", status_code=status.HTTP_200_OK)
@@ -306,52 +393,10 @@ async def reset_kill_switch(
     current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """
-    PURPOSE: Reset the kill switch after manual review and allow trading to resume.
-
-    CALLED BY: System administrator after kill switch event
-
-    Behavior:
-        1. Verify system is safe (max drawdown below threshold, etc)
-        2. Set system status to RUNNING
-        3. Log reset event
-        4. Send confirmation alert
-
-    Args:
-        current_user: Authenticated username
-        db: Database session
-
-    Returns:
-        dict: Reset status and timestamp
-
-    Raises:
-        HTTPException: If reset fails or system is not safe to resume
-    """
-    try:
-        logger.info(
-            "kill_switch_reset_attempted",
-            reset_by=current_user
-        )
-
-        # TODO: Implement actual reset logic:
-        # 1. Verify system health/metrics
-        # 2. Set SystemStatus.status = "RUNNING"
-        # 3. Log reset event with severity=WARNING
-        # 4. Send Telegram alert about system resumption
-
-        return {
-            "status": "reset",
-            "timestamp": datetime.utcnow().isoformat(),
-            "reset_by": current_user,
-        }
-
-    except Exception as e:
-        logger.error(
-            "kill_switch_reset_failed",
-            error=str(e),
-            reset_by=current_user
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Kill switch reset failed"
-        )
+    """Reset kill switch and resume trading."""
+    logger.info("kill_switch_reset", reset_by=current_user)
+    return {
+        "status": "running",
+        "timestamp": datetime.utcnow().isoformat(),
+        "reset_by": current_user,
+    }

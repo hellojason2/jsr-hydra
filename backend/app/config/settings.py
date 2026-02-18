@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     MT5_LOGIN: int = 0
     MT5_PASSWORD: str = ""
     MT5_SERVER: str = ""
+    MT5_REST_URL: str = "http://jsr-mt5:18812"
+    MAX_TEST_LOTS: float = 0.01
 
     # Telegram Notifications
     TELEGRAM_BOT_TOKEN: str = ""
@@ -43,6 +45,10 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     JWT_SECRET: str = "change-me-in-production"
     API_KEY: str = "change-me-in-production"
+
+    # OpenAI LLM Configuration
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     # Admin Credentials
     ADMIN_USERNAME: str = "admin"

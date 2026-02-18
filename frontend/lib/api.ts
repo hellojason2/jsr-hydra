@@ -14,10 +14,10 @@ import {
   HealthCheck,
 } from "./types";
 
-const BASE_URL =
-  typeof window !== "undefined"
-    ? process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
-    : process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Use relative URLs so requests go through Caddy reverse proxy (same origin).
+// NEXT_PUBLIC_API_URL gets baked at build time and defaults to localhost:8000
+// which breaks when the browser is on a different machine than the server.
+const BASE_URL = "";
 
 /**
  * Helper function to fetch from API with auth header
@@ -53,6 +53,8 @@ async function fetchApi<T>(
     if (response.status === 401) {
       if (typeof window !== "undefined") {
         localStorage.removeItem("auth_token");
+        // Clear Zustand persisted auth state so it doesn't restore stale isAuthenticated
+        localStorage.removeItem("app-store");
         window.location.href = "/login";
       }
     }
@@ -80,28 +82,37 @@ export async function login(
  * Dashboard APIs
  */
 export async function getDashboard(): Promise<DashboardSummary> {
-  return fetchApi<DashboardSummary>("/api/dashboard");
+  return fetchApi<DashboardSummary>("/api/system/dashboard");
+}
+
+/**
+ * Health Check API (public, no auth required)
+ */
+export async function getHealth(): Promise<HealthCheck> {
+  return fetchApi<HealthCheck>("/api/system/health");
 }
 
 /**
  * Trade APIs
  */
 export interface TradeFilters {
-  status?: "OPEN" | "CLOSED" | "PENDING";
+  status?: string;
   symbol?: string;
   strategy_code?: string;
-  limit?: number;
-  offset?: number;
+  page?: number;
+  per_page?: number;
+  days_ago?: number;
 }
 
 export async function getTrades(filters: TradeFilters = {}): Promise<TradeList> {
   const params = new URLSearchParams();
 
-  if (filters.status) params.append("status", filters.status);
-  if (filters.symbol) params.append("symbol", filters.symbol);
-  if (filters.strategy_code) params.append("strategy_code", filters.strategy_code);
-  if (filters.limit) params.append("limit", filters.limit.toString());
-  if (filters.offset) params.append("offset", filters.offset.toString());
+  if (filters.status) params.append("status_filter", filters.status);
+  if (filters.symbol) params.append("symbol_filter", filters.symbol);
+  if (filters.strategy_code) params.append("strategy_filter", filters.strategy_code);
+  if (filters.page) params.append("page", filters.page.toString());
+  if (filters.per_page) params.append("per_page", filters.per_page.toString());
+  if (filters.days_ago !== undefined) params.append("days_ago", filters.days_ago.toString());
 
   const query = params.toString();
   const endpoint = `/api/trades${query ? `?${query}` : ""}`;
@@ -138,22 +149,29 @@ export async function updateStrategy(
  * Kill Switch APIs
  */
 export async function triggerKillSwitch(): Promise<void> {
-  return fetchApi<void>("/api/risk/kill-switch", {
+  return fetchApi<void>("/api/system/kill-switch", {
     method: "POST",
   });
 }
 
 export async function resetKillSwitch(): Promise<void> {
-  return fetchApi<void>("/api/risk/kill-switch/reset", {
+  return fetchApi<void>("/api/system/kill-switch/reset", {
     method: "POST",
   });
 }
 
 /**
- * Health Check API
+ * Positions API
  */
-export async function getHealth(): Promise<HealthCheck> {
-  return fetchApi<HealthCheck>("/api/health");
+export async function getPositions(): Promise<any[]> {
+  return fetchApi<any[]>("/api/system/positions");
+}
+
+/**
+ * Live Tick API
+ */
+export async function getTick(symbol: string): Promise<any> {
+  return fetchApi<any>(`/api/system/tick/${symbol}`);
 }
 
 export { BASE_URL };

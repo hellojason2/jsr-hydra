@@ -50,14 +50,25 @@ def is_market_open(symbol: str = "XAUUSD") -> bool:
 
 def is_weekend() -> bool:
     """
-    PURPOSE: Determine if the current UTC time falls on a weekend.
+    PURPOSE: Determine if forex market is in weekend closure.
+
+    Forex weekend closure: Friday 22:00 UTC to Sunday 22:00 UTC.
+    This aligns with is_market_open() so the two checks don't contradict.
 
     Returns:
-        bool: True if current day is Saturday or Sunday (UTC), False otherwise.
+        bool: True if currently in weekend closure period, False otherwise.
     """
     now = get_utc_now()
     weekday = now.weekday()  # Monday=0, Sunday=6
-    return weekday >= 5  # Saturday=5, Sunday=6
+    hour = now.hour
+
+    if weekday == 5:  # Saturday — always closed
+        return True
+    if weekday == 4 and hour >= 22:  # Friday after 22:00 UTC — closed
+        return True
+    if weekday == 6 and hour < 22:  # Sunday before 22:00 UTC — still closed
+        return True
+    return False
 
 
 def get_session(dt: Optional[datetime] = None) -> str:

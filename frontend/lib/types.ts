@@ -25,16 +25,30 @@ export interface AccountInfo {
 // Trade Related
 export interface TradeResponse {
   id: string;
+  master_id: string;
+  strategy_id: string | null;
+  idempotency_key: string | null;
+  mt5_ticket: number | null;
   symbol: string;
-  direction: "BUY" | "SELL";
+  direction: string;
   lots: number;
   entry_price: number;
   exit_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
   profit: number;
-  status: "OPEN" | "CLOSED" | "PENDING";
-  strategy_code: string;
+  commission: number;
+  swap: number;
+  net_profit: number;
+  regime_at_entry: string | null;
+  confidence: number | null;
+  reason: string | null;
+  status: string;
+  is_simulated: boolean;
   opened_at: string;
   closed_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface TradeCreate {
@@ -51,8 +65,10 @@ export interface TradeUpdate {
 }
 
 export interface TradeList {
-  total: number;
   trades: TradeResponse[];
+  total: number;
+  page: number;
+  per_page: number;
 }
 
 export interface TradeStats {

@@ -42,7 +42,7 @@ export function StrategyDetail({
     setIsToggling(true)
     try {
       const response = await fetch(`/api/strategies/${code}`, {
-        method: 'POST',
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),
       })

@@ -1,14 +1,14 @@
 """
-PURPOSE: Strategy D - Volatility Harvester using Bollinger Bands and RSI.
+PURPOSE: Strategy D - Momentum Scalper using Bollinger Bands OR RSI.
 
 STRATEGY LOGIC:
-    - Identifies oversold/overbought conditions using Bollinger Bands and RSI
-    - Generates BUY when price < lower_band AND RSI < oversold threshold
-    - Generates SELL when price > upper_band AND RSI > overbought threshold
+    - Generates signals when EITHER BB or RSI condition is met (not both required)
+    - BUY when price < lower_band OR RSI < oversold threshold
+    - SELL when price > upper_band OR RSI > overbought threshold
+    - Momentum burst detection: large candle body + high body ratio triggers signal
     - Confidence based on RSI deviation from center (50)
-    - SL = entry ± ATR * 1.5
-    - TP = middle Bollinger Band (SMA)
-    - Optimal in volatile markets with mean-reversion tendency
+    - Tighter stops: SL = 1.0 * ATR, TP = 1.5 * ATR
+    - Designed for aggressive scalping on M15 timeframe
 
 CALLED BY: engine/orchestrator.py → run_cycle()
 """
@@ -33,11 +33,11 @@ logger = get_logger("strategies.strategy_d")
 
 class StrategyD(BaseStrategy):
     """
-    PURPOSE: Volatility Harvester strategy using Bollinger Bands and RSI.
+    PURPOSE: Momentum Scalper strategy using Bollinger Bands OR RSI.
 
-    Harvests volatility by identifying extreme price levels (band touches)
-    combined with momentum confirmation (RSI extremes). Trades mean-reversion
-    scenarios in volatile markets.
+    Aggressively scalps by firing on EITHER BB or RSI extremes (not both
+    required). Also detects momentum bursts from large candle bodies.
+    Uses tighter stops for quick in-and-out trades.
 
     CALLED BY: engine/orchestrator.py
     """
@@ -71,7 +71,7 @@ class StrategyD(BaseStrategy):
         """
         super().__init__(
             code=StrategyCode.D,
-            name="Volatility Harvester (BB + RSI)",
+            name="Momentum Scalper (BB | RSI)",
             data_feed=data_feed,
             order_manager=order_manager,
             event_bus=event_bus,
@@ -100,17 +100,18 @@ class StrategyD(BaseStrategy):
 
     def generate_signal(self, candles_df: pd.DataFrame) -> Optional[StrategySignal]:
         """
-        PURPOSE: Generate trading signal based on Bollinger Bands extremes and RSI confirmation.
+        PURPOSE: Generate trading signal based on BB OR RSI extremes, plus momentum bursts.
 
         Logic:
         1. Validate sufficient data availability
-        2. Calculate Bollinger Bands and RSI
-        3. Check for oversold bounce: price < lower_band AND RSI < oversold
-        4. Check for overbought reversal: price > upper_band AND RSI > overbought
-        5. Calculate confidence based on RSI deviation from center
-        6. Set SL with ATR * 1.5 buffer
-        7. Set TP at middle Bollinger Band (mean reversion target)
-        8. Handle edge cases: NaN values, insufficient data
+        2. Calculate Bollinger Bands, RSI, ATR
+        3. EITHER condition triggers signal (not both required):
+           - Price below lower BB → BUY
+           - Price above upper BB → SELL
+           - RSI below oversold → BUY
+           - RSI above overbought → SELL
+        4. Momentum burst: large candle body (>1.5x avg of last 5) with body_ratio > 0.6
+        5. Tighter stops: SL = 1.0 * ATR, TP = 1.5 * ATR
 
         Args:
             candles_df: DataFrame with OHLCV columns (open, high, low, close, volume)
@@ -136,6 +137,7 @@ class StrategyD(BaseStrategy):
             close = candles_df['close']
             high = candles_df['high']
             low = candles_df['low']
+            open_price = candles_df['open']
 
             # Calculate Bollinger Bands
             upper_band, middle_band, lower_band = bollinger_bands(
@@ -152,6 +154,9 @@ class StrategyD(BaseStrategy):
 
             # Get latest values
             latest_close = close.iloc[-1]
+            latest_open = open_price.iloc[-1]
+            latest_high = high.iloc[-1]
+            latest_low = low.iloc[-1]
             latest_upper_band = upper_band.iloc[-1]
             latest_middle_band = middle_band.iloc[-1]
             latest_lower_band = lower_band.iloc[-1]
@@ -171,41 +176,84 @@ class StrategyD(BaseStrategy):
                 )
                 return None
 
-            # Detect oversold bounce: price < lower_band AND RSI < oversold
-            if latest_close < latest_lower_band and latest_rsi < self._rsi_oversold:
-                signal_direction = OrderDirection.BUY
-                # SL below current price by ATR * 1.5
-                sl_price = latest_close - (latest_atr * 1.5)
-                # TP at middle band (mean reversion target)
-                tp_price = latest_middle_band
+            signal_direction = None
+            reasons = []
 
+            # --- Check BB conditions (EITHER triggers) ---
+            bb_buy = latest_close < latest_lower_band
+            bb_sell = latest_close > latest_upper_band
+
+            # --- Check RSI conditions (EITHER triggers) ---
+            rsi_buy = latest_rsi < self._rsi_oversold
+            rsi_sell = latest_rsi > self._rsi_overbought
+
+            # --- Check momentum burst ---
+            momentum_buy = False
+            momentum_sell = False
+            if len(candles_df) >= 6:
+                current_body = abs(latest_close - latest_open)
+                candle_range = latest_high - latest_low
+                body_ratio = current_body / candle_range if candle_range > 0 else 0
+
+                # Average body of last 5 candles (excluding current)
+                recent_bodies = abs(close.iloc[-6:-1] - open_price.iloc[-6:-1])
+                avg_body = recent_bodies.mean()
+
+                if current_body > 1.5 * avg_body and body_ratio > 0.6:
+                    if latest_close > latest_open:
+                        momentum_buy = True
+                    else:
+                        momentum_sell = True
+
+            # --- Determine signal direction ---
+            buy_signals = []
+            sell_signals = []
+
+            if bb_buy:
+                buy_signals.append(f"price {latest_close:.5f} < lower BB {latest_lower_band:.5f}")
+            if rsi_buy:
+                buy_signals.append(f"RSI {latest_rsi:.1f} < {self._rsi_oversold}")
+            if momentum_buy:
+                buy_signals.append("momentum burst (bullish)")
+
+            if bb_sell:
+                sell_signals.append(f"price {latest_close:.5f} > upper BB {latest_upper_band:.5f}")
+            if rsi_sell:
+                sell_signals.append(f"RSI {latest_rsi:.1f} > {self._rsi_overbought}")
+            if momentum_sell:
+                sell_signals.append("momentum burst (bearish)")
+
+            if buy_signals and not sell_signals:
+                signal_direction = OrderDirection.BUY
+                reasons = buy_signals
                 logger.info(
-                    "oversold_bounce_detected",
+                    "scalper_buy_detected",
                     close=latest_close,
                     lower_band=latest_lower_band,
                     rsi=latest_rsi,
-                    rsi_oversold=self._rsi_oversold
+                    triggers=buy_signals
                 )
-
-            # Detect overbought reversal: price > upper_band AND RSI > overbought
-            elif latest_close > latest_upper_band and latest_rsi > self._rsi_overbought:
+            elif sell_signals and not buy_signals:
                 signal_direction = OrderDirection.SELL
-                # SL above current price by ATR * 1.5
-                sl_price = latest_close + (latest_atr * 1.5)
-                # TP at middle band (mean reversion target)
-                tp_price = latest_middle_band
-
+                reasons = sell_signals
                 logger.info(
-                    "overbought_reversal_detected",
+                    "scalper_sell_detected",
                     close=latest_close,
                     upper_band=latest_upper_band,
                     rsi=latest_rsi,
-                    rsi_overbought=self._rsi_overbought
+                    triggers=sell_signals
                 )
-
             else:
-                # No setup detected
+                # No signal or conflicting signals
                 return None
+
+            # Tighter stops: SL = 1.0 * ATR, TP = 1.5 * ATR
+            if signal_direction == OrderDirection.BUY:
+                sl_price = latest_close - (latest_atr * 1.0)
+                tp_price = latest_close + (latest_atr * 1.5)
+            else:  # SELL
+                sl_price = latest_close + (latest_atr * 1.0)
+                tp_price = latest_close - (latest_atr * 1.5)
 
             # Ensure SL and TP are valid
             if sl_price <= 0 or tp_price <= 0:
@@ -217,16 +265,16 @@ class StrategyD(BaseStrategy):
                 return None
 
             # Calculate confidence based on RSI deviation from center (50)
-            # abs(RSI - 50) / 50 gives 0-1 scale, clamped to [0, 1]
             confidence = min(abs(latest_rsi - 50.0) / 50.0, 1.0)
 
             # Create and return signal
+            reason_str = "Momentum scalp: " + "; ".join(reasons)
             signal = StrategySignal(
                 direction=signal_direction,
                 confidence=confidence,
                 sl_price=sl_price,
                 tp_price=tp_price,
-                reason=f"Volatility harvest: BB bands {latest_lower_band:.4f}-{latest_upper_band:.4f}, RSI={latest_rsi:.2f}",
+                reason=reason_str,
                 strategy_code=self._code.value
             )
 
@@ -237,7 +285,8 @@ class StrategyD(BaseStrategy):
                 sl=sl_price,
                 tp=tp_price,
                 rsi=latest_rsi,
-                atr=latest_atr
+                atr=latest_atr,
+                triggers=reasons
             )
 
             return signal

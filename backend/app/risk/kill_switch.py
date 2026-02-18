@@ -201,10 +201,10 @@ class KillSwitch:
 
             # Close all open positions
             try:
-                closed_positions = self._order_manager.close_all_positions()
+                closed_positions = await self._order_manager.close_all_positions()
                 logger.info(
                     "kill_switch_closed_positions",
-                    count=len(closed_positions)
+                    count=len(closed_positions) if closed_positions else 0
                 )
             except Exception as e:
                 logger.error(
