@@ -19,9 +19,10 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
 from app.api import api_router
-from app.api.routes_ws import router as ws_router
+from app.api.routes_ws import router as ws_router, setup_ws_event_handlers
 from app.config.settings import settings
-from app.events.bus import get_event_bus
+from app.events.bus import get_event_bus, set_event_bus
+from app.events.handlers import register_all_handlers
 from app.utils.logger import setup_logging, get_logger
 from app.version import get_version
 
@@ -56,16 +57,77 @@ async def on_startup() -> None:
             dry_run=settings.DRY_RUN
         )
 
+        # Run Alembic migrations to ensure schema is up to date
+        try:
+            from alembic.config import Config
+            from alembic import command
+            alembic_cfg = Config("/app/alembic.ini")
+            command.upgrade(alembic_cfg, "head")
+            logger.info("alembic_upgrade_complete")
+        except Exception as e:
+            logger.warning("alembic_upgrade_skipped", error=str(e))
+
         # Connect to EventBus
         event_bus = get_event_bus()
         await event_bus.connect()
+        # Store the connected instance as the global singleton so all
+        # modules that call get_event_bus() share this connected bus.
+        set_event_bus(event_bus)
         logger.info("event_bus_connected")
 
-        # TODO: Register event handlers for background tasks:
-        # - Trade closed handler (calculate stats)
-        # - Regime changed handler (alert frontend)
-        # - Kill switch handler (emergency procedures)
-        # - etc.
+        # Register event handlers
+        register_all_handlers(event_bus)
+        logger.info("event_handlers_registered")
+
+        # Register WebSocket broadcast handlers for real-time client updates
+        await setup_ws_event_handlers(event_bus)
+        logger.info("ws_event_handlers_registered")
+
+        # Start Redis subscription listener as a background task so this
+        # process receives events published by other processes (e.g., engine).
+        asyncio.create_task(event_bus.subscribe_redis())
+        logger.info("redis_subscription_started")
+
+        # Seed default strategies so API endpoints work even without the engine
+        try:
+            from app.db.engine import AsyncSessionLocal
+            from app.models.strategy import Strategy
+            from sqlalchemy import select
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(Strategy).limit(1))
+                if not result.scalar_one_or_none():
+                    for code, name in [
+                        ("A", "Trend Following"),
+                        ("B", "Mean Reversion"),
+                        ("C", "Session Breakout"),
+                        ("D", "Momentum Scalper"),
+                    ]:
+                        session.add(Strategy(code=code, name=name, status="active", allocation_pct=25.0))
+                    await session.commit()
+                    logger.info("default_strategies_seeded")
+        except Exception as e:
+            logger.warning("strategy_seeding_failed", error=str(e))
+
+        # Ensure a MasterAccount row exists so trade endpoints can reference it
+        try:
+            from app.db.engine import AsyncSessionLocal
+            from app.models.account import MasterAccount
+            from sqlalchemy import select
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(MasterAccount).limit(1))
+                if not result.scalar_one_or_none():
+                    master = MasterAccount(
+                        mt5_login=settings.MT5_LOGIN or 99999,
+                        broker=settings.MT5_SERVER or "Unknown",
+                        status="RUNNING",
+                    )
+                    session.add(master)
+                    await session.commit()
+                    logger.info("default_master_account_seeded")
+        except Exception as e:
+            logger.warning("master_account_seeding_failed", error=str(e))
 
         logger.info("application_startup_complete")
 
@@ -242,10 +304,14 @@ def create_app() -> FastAPI:
     # Middleware
     # ────────────────────────────────────────────────────────────
 
-    # CORS middleware - allow all origins in development
+    # CORS middleware - restricted to known frontend origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # TODO: Restrict to frontend URL in production
+        allow_origins=[
+            "https://ai.jsralgo.com",
+            "http://localhost:3000",
+            "http://localhost:8000",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

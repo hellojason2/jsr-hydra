@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile
     container_name: jsr-mt5
     ports:
-      - "5900:5900"
-      - "6901:6901"
+      - "127.0.0.1:5900:5900"
+      - "127.0.0.1:6901:6901"
       - "18812:18812"
     volumes:
       - jsr-mt5data:/config
@@ -17,25 +17,28 @@ services:
       - MT5_PASSWORD=${MT5_PASSWORD:-}
       - MT5_SERVER=${MT5_SERVER:-}
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "terminal64.exe"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:18812/health || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 120s
+      retries: 10
+      start_period: 180s
     restart: unless-stopped
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
   jsr-postgres:
     image: postgres:16-alpine
     container_name: jsr-postgres
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_DB: jsr_hydra
       POSTGRES_USER: ${DB_USER:-postgres}
@@ -53,14 +56,20 @@ services:
         limits:
           cpus: "1.0"
           memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
   jsr-redis:
     image: redis:7-alpine
     container_name: jsr-redis
-    ports:
-      - "6379:6379"
+    volumes:
+      - jsr-redisdata:/data
+    command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -72,6 +81,11 @@ services:
         limits:
           cpus: "0.5"
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
@@ -87,21 +101,34 @@ services:
       - REDIS_URL=redis://jsr-redis:6379/0
       - MT5_HOST=jsr-mt5
       - MT5_RPYC_PORT=18812
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-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}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
     env_file:
       - .env
+    volumes:
+      - ./version.json:/app/version.json:ro
     depends_on:
       jsr-postgres:
         condition: service_healthy
       jsr-redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/system/health\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
@@ -116,13 +143,17 @@ services:
       - REDIS_URL=redis://jsr-redis:6379/0
       - MT5_HOST=jsr-mt5
       - MT5_RPYC_PORT=18812
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-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}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
     env_file:
       - .env
     depends_on:
+      jsr-postgres:
+        condition: service_healthy
+      jsr-redis:
+        condition: service_healthy
       jsr-backend:
-        condition: service_started
+        condition: service_healthy
       jsr-mt5:
         condition: service_healthy
     restart: unless-stopped
@@ -133,9 +164,16 @@ services:
           memory: 2G
     volumes:
       - jsr-mlmodels:/app/models
+      - ./version.json:/app/version.json:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
+  # Placeholder service — not yet implemented; kept at minimal resource footprint
   jsr-retrainer:
     build:
       context: ./backend
@@ -155,9 +193,14 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 4G
+          memory: 256m
     volumes:
       - jsr-mlmodels:/app/models
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
@@ -168,8 +211,6 @@ services:
     container_name: jsr-frontend
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://jsr-backend:8000
     depends_on:
       - jsr-backend
     restart: unless-stopped
@@ -178,6 +219,11 @@ services:
         limits:
           cpus: "0.5"
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
@@ -190,7 +236,15 @@ services:
     volumes:
       - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile
       - jsr-caddydata:/data
+    depends_on:
+      - jsr-backend
+      - jsr-frontend
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - jsr-network
 
@@ -199,6 +253,7 @@ volumes:
   jsr-mt5data:
   jsr-mlmodels:
   jsr-caddydata:
+  jsr-redisdata:
 
 networks:
   jsr-network:

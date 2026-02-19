@@ -11,7 +11,7 @@ CALLED BY:
     - risk_manager
 """
 
-import redis
+import redis.asyncio as aioredis
 import hashlib
 import time
 from typing import Optional
@@ -65,20 +65,21 @@ class OrderManager:
         self._connector = connector
         self._dry_run = dry_run
         self._max_test_lots = max_test_lots
-        self._redis: Optional[redis.Redis] = None
+        self._redis: Optional[aioredis.Redis] = None
         self._next_ticket = 1000  # Counter for dry-run simulated tickets
+        self._simulated_positions: dict[int, dict] = {}  # ticket -> position info
 
+        # Build async Redis client (connection is lazy — no blocking ping in __init__)
         try:
-            self._redis = redis.from_url(
+            self._redis = aioredis.from_url(
                 redis_url,
                 decode_responses=True,
                 socket_connect_timeout=5,
                 socket_keepalive=True,
             )
-            self._redis.ping()
-            logger.info("redis_connected", url=redis_url)
-        except redis.ConnectionError as e:
-            logger.error("redis_connection_failed", error=str(e))
+            logger.info("redis_client_created", url=redis_url)
+        except Exception as e:
+            logger.error("redis_client_creation_failed", error=str(e))
             if not dry_run:
                 raise
             # In dry-run mode, Redis is optional
@@ -177,7 +178,7 @@ class OrderManager:
 
         if self._redis:
             try:
-                if self._redis.exists(idempotency_key):
+                if await self._redis.exists(idempotency_key):
                     logger.warning(
                         "duplicate_order_detected",
                         symbol=symbol,
@@ -187,21 +188,36 @@ class OrderManager:
                     return None
 
                 # Set key with 10 second TTL
-                self._redis.setex(idempotency_key, 10, "1")
+                await self._redis.setex(idempotency_key, 10, "1")
 
-            except redis.RedisError as e:
+            except aioredis.RedisError as e:
                 logger.error("redis_idempotency_check_failed", error=str(e))
                 logger.warning("idempotency_check_skipped_due_to_redis_error")
 
         # ----- DRY RUN: log only, simulate response -----
         if self._dry_run:
             self._next_ticket += 1
+            ticket = self._next_ticket
             simulated = {
                 "retcode": 10009,
                 "comment": "DRY_RUN simulated",
-                "ticket": self._next_ticket,
+                "ticket": ticket,
                 "price": 0.0,
                 "volume": lots,
+            }
+            # Register the simulated position so get_open_positions() can return it
+            entry_price = sl  # sl passed in; real entry unknown in dry-run, use 0
+            self._simulated_positions[ticket] = {
+                "ticket": ticket,
+                "symbol": symbol,
+                "type": 0 if direction.upper() == "BUY" else 1,
+                "volume": lots,
+                "price_open": 0.0,
+                "sl": sl or 0,
+                "tp": tp or 0,
+                "profit": 0.0,
+                "time": int(time.time()),
+                "direction": direction.upper(),
             }
             logger.info(
                 "dry_run_order_simulated",
@@ -210,7 +226,7 @@ class OrderManager:
                 lots=lots,
                 sl=sl,
                 tp=tp,
-                ticket=simulated["ticket"],
+                ticket=ticket,
             )
             return simulated
 
@@ -269,6 +285,7 @@ class OrderManager:
         logger.info("close_position_requested", ticket=ticket, dry_run=self._dry_run)
 
         if self._dry_run:
+            self.close_simulated_position(ticket)
             logger.info("dry_run_close_simulated", ticket=ticket)
             return {
                 "retcode": 10009,
@@ -325,19 +342,25 @@ class OrderManager:
 
     async def get_open_positions(self) -> list[dict]:
         """
-        PURPOSE: Get all currently open positions from MT5 REST bridge.
+        PURPOSE: Get all currently open positions.
 
-        Calls GET /positions.
+        In DRY_RUN mode: returns the in-memory simulated position registry.
+        In LIVE mode: calls GET /positions on the MT5 REST bridge.
 
         Returns:
             list[dict]: List of position dicts, each with keys:
-                ticket, symbol, type, lots, price_open, price_current,
-                sl, tp, profit, swap, commission, comment.
+                ticket, symbol, type, volume, price_open,
+                sl, tp, profit, (and direction for dry-run positions).
 
         Raises:
-            ConnectionError: If MT5 REST call fails.
+            ConnectionError: If MT5 REST call fails (live mode only).
         """
         logger.info("get_open_positions_requested", dry_run=self._dry_run)
+
+        if self._dry_run:
+            positions = list(self._simulated_positions.values())
+            logger.info("dry_run_positions_returned", count=len(positions))
+            return positions
 
         try:
             client = await self._connector._get_client()
@@ -351,6 +374,26 @@ class OrderManager:
         except Exception as e:
             logger.error("get_open_positions_error", error=str(e))
             raise ConnectionError(f"Failed to get open positions: {e}")
+
+    def close_simulated_position(self, ticket: int) -> Optional[dict]:
+        """
+        PURPOSE: Remove a simulated position from the in-memory registry.
+
+        Called by the engine when a DRY_RUN position's SL or TP has been hit,
+        so that `get_open_positions()` no longer returns it.
+
+        Args:
+            ticket: Simulated position ticket number.
+
+        Returns:
+            dict: The removed position info, or None if ticket not found.
+        """
+        removed = self._simulated_positions.pop(ticket, None)
+        if removed:
+            logger.info("simulated_position_closed", ticket=ticket)
+        else:
+            logger.warning("simulated_position_not_found_for_close", ticket=ticket)
+        return removed
 
     async def get_position_by_ticket(self, ticket: int) -> Optional[dict]:
         """

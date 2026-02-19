@@ -22,7 +22,12 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
-import redis
+try:
+    import redis.asyncio as redis_async
+    import redis as redis_sync
+except ImportError:
+    import redis as redis_sync
+    redis_async = None
 
 from app.brain.analyzer import (
     analyze_trend,
@@ -129,9 +134,10 @@ class Brain:
             logger.info("brain_llm_disabled", reason="No OPENAI_API_KEY configured")
 
         # Redis for cross-process state sharing (engine writes, API reads)
-        self._redis: Optional[redis.Redis] = None
+        # Using synchronous redis client; writes are wrapped in executor when called from async context
+        self._redis: Optional[redis_sync.Redis] = None
         try:
-            self._redis = redis.from_url(
+            self._redis = redis_sync.from_url(
                 settings.REDIS_URL,
                 decode_responses=True,
                 socket_connect_timeout=3,
@@ -149,17 +155,40 @@ class Brain:
     # ════════════════════════════════════════════════════════════════
 
     def _sync_to_redis(self) -> None:
-        """Write current brain state to Redis so the API process can read it."""
+        """Write current brain state to Redis so the API process can read it.
+        
+        Uses run_in_executor when an event loop is running to avoid blocking
+        the async engine loop with synchronous Redis I/O.
+        """
         if not self._redis:
             return
         try:
             state = self.get_state()
-            self._redis.set(self.REDIS_KEY, json.dumps(state, default=str), ex=30)
+            serialized = json.dumps(state, default=str)
+            redis_client = self._redis
+            redis_key = self.REDIS_KEY
+
+            def _do_redis_set():
+                redis_client.set(redis_key, serialized, ex=30)
+
+            try:
+                loop = asyncio.get_running_loop()
+                # We are inside an async context — schedule the blocking call off the main thread
+                asyncio.ensure_future(
+                    loop.run_in_executor(None, _do_redis_set)
+                )
+            except RuntimeError:
+                # No running event loop — call directly (e.g. tests or startup)
+                _do_redis_set()
         except Exception as e:
             logger.debug("brain_redis_sync_failed", error=str(e))
 
     def load_from_redis(self) -> Optional[dict]:
-        """Read brain state from Redis (used by API process when local brain has no data)."""
+        """Read brain state from Redis (used by API process when local brain has no data).
+        
+        Synchronous read — safe to call from sync contexts. For async callers,
+        the try/except prevents event loop blocking on connection errors.
+        """
         if not self._redis:
             return None
         try:
@@ -497,6 +526,34 @@ class Brain:
                             },
                         },
                     )
+
+                # Write new allocations to the database
+                allocations = rebalance_result.get("allocations", {})
+                if allocations and self._auto_allocator._enabled:
+                    try:
+                        import asyncio as _asyncio
+                        from app.db.engine import AsyncSessionLocal
+                        from app.models.strategy import Strategy
+                        from sqlalchemy import update
+
+                        async def _apply_allocations_to_db():
+                            async with AsyncSessionLocal() as session:
+                                for strategy_code, alloc_pct in allocations.items():
+                                    await session.execute(
+                                        update(Strategy)
+                                        .where(Strategy.code == strategy_code)
+                                        .values(allocation_pct=alloc_pct)
+                                    )
+                                await session.commit()
+                            logger.info("auto_allocation_applied_to_db", allocations=allocations)
+
+                        loop = _asyncio.get_event_loop()
+                        if loop.is_running():
+                            _asyncio.ensure_future(_apply_allocations_to_db())
+                        else:
+                            loop.run_until_complete(_apply_allocations_to_db())
+                    except Exception as db_err:
+                        logger.warning("auto_allocation_db_write_failed", error=str(db_err))
         except Exception as e:
             logger.debug("auto_allocator_error", error=str(e))
 

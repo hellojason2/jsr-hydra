@@ -21,7 +21,7 @@ from app.bridge.connector import MT5Connector
 from app.bridge.data_feed import DataFeed
 from app.bridge.order_manager import OrderManager
 from app.bridge.account_info import AccountInfo
-from app.events.bus import EventBus
+from app.events.bus import EventBus, set_event_bus
 from app.events.handlers import register_all_handlers
 from app.db.engine import AsyncSessionLocal
 from app.risk.kill_switch import KillSwitch
@@ -111,6 +111,7 @@ class TradingEngine:
         """
         self.settings = settings_obj or settings
         self._is_running = False
+        self._running = False  # Used by graceful shutdown signal handlers
         self._loop_interval = 5  # 5 seconds between cycles for real trading
         self._start_time: Optional[datetime] = None
         self._symbols: List[str] = list(TRADING_SYMBOLS)
@@ -149,6 +150,52 @@ class TradingEngine:
             symbols=self._symbols
         )
 
+    async def _ensure_strategies_seeded(self) -> None:
+        """
+        PURPOSE: Seed default strategies A, B, C, D into the DB if they don't exist.
+
+        Called at startup before the main trading loop so that trade recording
+        never fails silently due to missing strategy rows.
+
+        CALLED BY: start()
+        """
+        from app.models.strategy import Strategy
+        from sqlalchemy import select as sa_select
+
+        default_strategies = [
+            {"code": "A", "name": "Trend Following", "status": "active", "allocation_pct": 25.0},
+            {"code": "B", "name": "Mean Reversion", "status": "active", "allocation_pct": 25.0},
+            {"code": "C", "name": "Session Breakout", "status": "active", "allocation_pct": 25.0},
+            {"code": "D", "name": "Momentum Scalper", "status": "active", "allocation_pct": 25.0},
+        ]
+
+        try:
+            async with AsyncSessionLocal() as session:
+                for strat_data in default_strategies:
+                    result = await session.execute(
+                        sa_select(Strategy).where(Strategy.code == strat_data["code"])
+                    )
+                    if not result.scalar_one_or_none():
+                        strategy = Strategy(**strat_data)
+                        session.add(strategy)
+                        logger.info("strategy_seeded", code=strat_data["code"])
+                await session.commit()
+        except Exception as e:
+            logger.warning("strategy_seeding_error", error=str(e))
+
+    async def _shutdown(self) -> None:
+        """
+        PURPOSE: Signal handler coroutine for graceful shutdown on SIGTERM/SIGINT.
+
+        Sets _running and _is_running to False so the main loop exits cleanly
+        on the next iteration check.
+
+        CALLED BY: Signal handlers registered in start()
+        """
+        logger.info("engine_shutdown_requested")
+        self._running = False
+        self._is_running = False
+
     async def start(self) -> None:
         """
         PURPOSE: Start the trading engine and main loop.
@@ -158,9 +205,10 @@ class TradingEngine:
         2. Connect EventBus to Redis
         3. Register event handlers
         4. Initialize risk management components
-        5. Register strategies
-        6. Start main trading loop
-        7. Handle signals (SIGINT, SIGTERM) for graceful shutdown
+        5. Seed default strategies into DB
+        6. Register strategies
+        7. Install graceful shutdown signal handlers (SIGTERM/SIGINT)
+        8. Start main trading loop
 
         CALLED BY: engine_runner.py, main entry point
         """
@@ -172,21 +220,52 @@ class TradingEngine:
 
             # 2. Connect event bus to Redis
             await self._event_bus.connect()
+            # Store as the global singleton so modules calling get_event_bus()
+            # share this connected instance instead of creating a separate one.
+            set_event_bus(self._event_bus)
             logger.info("event_bus_connected")
 
-            # 3. Register event handlers
+            # 3. Register event handlers and start Redis subscription listener
             register_all_handlers(self._event_bus)
+            asyncio.create_task(self._event_bus.subscribe_redis())
             logger.info("event_handlers_registered")
 
             # 4. Initialize risk management components
             self._init_risk_management()
             logger.info("risk_management_initialized")
 
-            # 5. Register strategies
+            # Register kill switch reset handler so the engine responds to
+            # KILL_SWITCH_RESET events published by the API reset endpoint.
+            kill_switch_ref = self._kill_switch
+
+            async def _handle_kill_switch_reset(payload) -> None:
+                try:
+                    kill_switch_ref.reset(admin_override=True)
+                    logger.warning(
+                        "kill_switch_reset_via_event",
+                        reset_by=payload.data.get("reset_by", "unknown")
+                    )
+                except Exception as reset_err:
+                    logger.error("kill_switch_reset_handler_failed", error=str(reset_err))
+
+            self._event_bus.on("KILL_SWITCH_RESET", _handle_kill_switch_reset)
+
+            # 5. Seed default strategies so trade recording never fails silently
+            await self._ensure_strategies_seeded()
+            logger.info("strategies_seeded")
+
+            # 6. Register strategies
             self._register_strategies()
             logger.info("strategies_registered", count=len(self._strategies))
 
-            # 6. Set running flag and record start time
+            # 7. Install graceful shutdown signal handlers (SIGTERM / SIGINT)
+            self._running = True
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self._shutdown()))
+            logger.info("signal_handlers_registered")
+
+            # 8. Set running flag and record start time
             self._is_running = True
             self._start_time = datetime.utcnow()
 
@@ -207,7 +286,7 @@ class TradingEngine:
                 strategies=len(self._strategies)
             )
 
-            # 7. Run main trading loop (blocking)
+            # 9. Run main trading loop (blocking)
             await self._main_loop()
 
         except Exception as e:
@@ -471,7 +550,7 @@ class TradingEngine:
         try:
             cycle_count = 0
 
-            while self._is_running:
+            while self._is_running and self._running:
                 cycle_count += 1
                 cycle_start = datetime.utcnow()
 
@@ -761,14 +840,16 @@ class TradingEngine:
                                 # Notify Brain about the trade execution
                                 try:
                                     brain = get_brain()
+                                    # Extract just the strategy letter (e.g. "A") from strat_key (e.g. "EURUSD_A")
+                                    pure_strategy_code = strat_key.split('_')[-1] if '_' in strat_key else strat_key
                                     brain.process_trade_result({
-                                        "strategy": strat_key,
+                                        "strategy": pure_strategy_code,
                                         "symbol": signal.symbol,
                                         "direction": signal.direction,
                                         "lots": risk_check.position_size,
                                         "entry_price": order_result.get('price'),
                                         "ticket": order_result.get('ticket'),
-                                        "regime_at_entry": regime['regime'].value if regime else None,
+                                        "regime_at_entry": _regime_str,
                                     })
                                 except Exception as brain_err:
                                     logger.warning("brain_trade_notify_error", error=str(brain_err))
@@ -808,6 +889,8 @@ class TradingEngine:
                                                 'strategy_code': strategy_code,
                                                 'symbol': signal.symbol,
                                                 'direction': signal.direction,
+                                                'sl': sl_price,
+                                                'tp': tp_price,
                                             }
 
                                         logger.info("trade_recorded_to_db", trade_id=str(db_trade.id), ticket=ticket)
@@ -854,7 +937,41 @@ class TradingEngine:
                     except Exception as e:
                         logger.warning("account_info_fetch_failed", error=str(e))
 
+                    # --- Kill switch auto-trigger checks ---
+                    try:
+                        account_info = await self._connector.get_account_info()
+                        if account_info:
+                            ks_balance = account_info.get('balance', 0)
+                            ks_equity = account_info.get('equity', 0)
+
+                            # Check drawdown-based kill switch
+                            if ks_balance > 0:
+                                peak_equity = max(ks_balance, ks_equity)
+                                if self._kill_switch.check_drawdown(ks_equity, peak_equity):
+                                    drawdown_pct = max(0, (peak_equity - ks_equity) / peak_equity * 100)
+                                    logger.critical("auto_kill_switch_drawdown", drawdown_pct=drawdown_pct)
+                                    await self._kill_switch.trigger_kill_switch()
+
+                            # Check daily loss-based kill switch
+                            if ks_balance > 0 and self._risk_manager._daily_pnl < 0:
+                                if self._kill_switch.check_daily_loss(self._risk_manager._daily_pnl, ks_balance):
+                                    daily_loss_pct = abs(self._risk_manager._daily_pnl) / ks_balance * 100
+                                    logger.critical("auto_kill_switch_daily_loss", daily_loss_pct=daily_loss_pct)
+                                    await self._kill_switch.trigger_kill_switch()
+                    except Exception as ks_err:
+                        logger.warning("kill_switch_auto_check_failed", error=str(ks_err))
+
                     # --- Log comprehensive JSON summary ---
+                    # Resolve regime string and confidence from the last symbol's regime object
+                    _regime_str = "UNKNOWN"
+                    _regime_conf = 0
+                    if isinstance(regime, dict):
+                        _regime_str = regime.get("regime", "UNKNOWN")
+                        _regime_conf = regime.get("confidence", 0)
+                    elif regime is not None and hasattr(regime, "regime"):
+                        _regime_str = regime.regime.value if hasattr(regime.regime, "value") else str(regime.regime)
+                        _regime_conf = getattr(regime, "confidence", 0)
+
                     cycle_summary = {
                         "event": "engine_cycle",
                         "cycle": cycle_count,
@@ -864,6 +981,15 @@ class TradingEngine:
                         "trades": all_trades,
                         "trades_this_cycle": len(all_trades),
                         "account": account_summary,
+                        # Fields required by Brain.process_cycle()
+                        "symbol": self._symbols[0] if self._symbols else "XAUUSD",
+                        "indicators": indicator_values,
+                        "regime": _regime_str,
+                        "confidence": _regime_conf,
+                        "new_candle": True,
+                        "bid": tick_data.get("bid", 0) if isinstance(tick_data, dict) else 0,
+                        "ask": tick_data.get("ask", 0) if isinstance(tick_data, dict) else 0,
+                        "spread": tick_data.get("spread", 0) if isinstance(tick_data, dict) else 0,
                     }
                     logger.info("engine_cycle", data=json.dumps(cycle_summary, default=str))
 
@@ -927,9 +1053,12 @@ class TradingEngine:
 
     async def _check_closed_positions(self) -> None:
         """
-        PURPOSE: Check MT5 positions and detect closures (SL/TP hit).
+        PURPOSE: Check positions and detect closures (SL/TP hit).
 
-        Compares tracked open trades against current MT5 positions.
+        DRY_RUN mode: checks current tick price against each tracked trade's
+        SL/TP levels and closes the simulated position when a level is breached.
+
+        LIVE mode: compares tracked open trades against current MT5 positions.
         For any trade no longer open in MT5, records closure in the database,
         updates strategy performance metrics, and notifies the Brain.
 
@@ -939,19 +1068,63 @@ class TradingEngine:
             return
 
         try:
-            mt5_positions = await self._order_manager.get_open_positions()
-            open_tickets = {p.get('ticket') for p in mt5_positions}
+            if self.settings.DRY_RUN:
+                # --- DRY_RUN: detect SL/TP hits via live tick data ---
+                closed_pairs = []  # list of (ticket, exit_price)
 
-            # Find trades that were open but are no longer in MT5
-            closed_tickets = [t for t in self._open_trades if t not in open_tickets]
+                for ticket, trade_info in list(self._open_trades.items()):
+                    symbol = trade_info.get('symbol', '')
+                    direction = trade_info.get('direction', 'BUY')
+                    sl = trade_info.get('sl', 0)
+                    tp = trade_info.get('tp', 0)
 
-            for ticket in closed_tickets:
-                trade_info = self._open_trades.pop(ticket)
-                trade_id = trade_info['trade_id']
-                strategy_code = trade_info['strategy_code']
+                    try:
+                        tick = await self._data_feed.get_tick(symbol)
+                    except Exception:
+                        continue
 
-                try:
-                    # Try to get closed position details from MT5 history
+                    if not tick:
+                        continue
+
+                    if direction == 'BUY':
+                        current_price = tick.get('bid', 0.0)
+                        sl_hit = bool(sl and current_price <= sl)
+                        tp_hit = bool(tp and current_price >= tp)
+                    else:  # SELL
+                        current_price = tick.get('ask', tick.get('bid', 0.0))
+                        sl_hit = bool(sl and current_price >= sl)
+                        tp_hit = bool(tp and current_price <= tp)
+
+                    if sl_hit or tp_hit:
+                        self._order_manager.close_simulated_position(ticket)
+                        closed_pairs.append((ticket, current_price))
+                        logger.info(
+                            "dry_run_sl_tp_hit",
+                            ticket=ticket,
+                            symbol=symbol,
+                            direction=direction,
+                            current_price=current_price,
+                            sl=sl,
+                            tp=tp,
+                            sl_hit=sl_hit,
+                            tp_hit=tp_hit,
+                        )
+
+                for ticket, exit_price in closed_pairs:
+                    trade_info = self._open_trades.pop(ticket)
+                    await self._process_closed_trade(ticket, trade_info, exit_price=exit_price)
+
+            else:
+                # --- LIVE: compare against real MT5 open positions ---
+                mt5_positions = await self._order_manager.get_open_positions()
+                open_tickets = {p.get('ticket') for p in mt5_positions}
+
+                closed_tickets_live = [t for t in self._open_trades if t not in open_tickets]
+
+                for ticket in closed_tickets_live:
+                    trade_info = self._open_trades.pop(ticket)
+
+                    # Try to get exit details from MT5 history
                     position_data = None
                     try:
                         client = await self._connector._get_client()
@@ -961,86 +1134,140 @@ class TradingEngine:
                     except Exception:
                         pass
 
-                    async with AsyncSessionLocal() as session:
-                        # Get the trade to find its entry price
-                        stmt = select(TradeModel).where(TradeModel.id == trade_id)
-                        result = await session.execute(stmt)
-                        trade_obj = result.scalar_one_or_none()
+                    exit_price = 0.0
+                    if position_data:
+                        exit_price = position_data.get('price', 0.0)
 
-                        if trade_obj:
-                            # Use position_data if available, otherwise estimate from current price
-                            exit_price = 0.0
-                            profit = 0.0
-                            commission = 0.0
-                            swap = 0.0
-
-                            if position_data:
-                                exit_price = position_data.get('price', 0.0)
-                                profit = position_data.get('profit', 0.0)
-                                commission = position_data.get('commission', 0.0)
-                                swap = position_data.get('swap', 0.0)
+                    if not exit_price:
+                        try:
+                            tick = await self._data_feed.get_tick(trade_info['symbol'])
+                            if trade_info['direction'] == 'BUY':
+                                exit_price = tick.get('bid', 0.0)
                             else:
-                                # Try to get from last known tick data
-                                try:
-                                    tick = await self._data_feed.get_tick(trade_info['symbol'])
-                                    if trade_info['direction'] == 'BUY':
-                                        exit_price = tick.get('bid', 0.0)
-                                    else:
-                                        exit_price = tick.get('ask', 0.0)
-                                except Exception:
-                                    pass
+                                exit_price = tick.get('ask', 0.0)
+                        except Exception:
+                            pass
 
-                            # Close the trade in DB
-                            await TradeService.close_trade(
-                                session, trade_id,
-                                exit_price=exit_price,
-                                profit=profit,
-                                commission=commission,
-                                swap=swap
-                            )
-
-                            # Update strategy performance
-                            try:
-                                # Re-fetch the closed trade
-                                stmt = select(TradeModel).where(TradeModel.id == trade_id)
-                                result = await session.execute(stmt)
-                                closed_trade = result.scalar_one_or_none()
-                                if closed_trade:
-                                    await StrategyService.update_strategy_performance(
-                                        session, strategy_code, closed_trade
-                                    )
-                            except Exception as perf_err:
-                                logger.warning("strategy_perf_update_failed", error=str(perf_err))
-
-                            # Notify Brain about the completed trade
-                            try:
-                                net_profit = profit - commission - swap
-                                brain = get_brain()
-                                brain.process_trade_result({
-                                    "strategy": f"{trade_info['symbol']}_{strategy_code}",
-                                    "symbol": trade_info['symbol'],
-                                    "direction": trade_info['direction'],
-                                    "entry_price": trade_obj.entry_price,
-                                    "exit_price": exit_price,
-                                    "profit": net_profit,
-                                    "won": net_profit > 0,
-                                    "ticket": ticket,
-                                })
-                            except Exception as brain_err:
-                                logger.warning("brain_close_notify_error", error=str(brain_err))
-
-                            logger.info(
-                                "trade_closed_detected",
-                                ticket=ticket,
-                                strategy=strategy_code,
-                                profit=profit,
-                            )
-
-                except Exception as close_err:
-                    logger.error("trade_close_processing_failed", ticket=ticket, error=str(close_err))
+                    await self._process_closed_trade(
+                        ticket, trade_info, exit_price=exit_price, position_data=position_data
+                    )
 
         except Exception as e:
             logger.warning("position_monitoring_failed", error=str(e))
+
+    async def _process_closed_trade(
+        self,
+        ticket: int,
+        trade_info: dict,
+        exit_price: float = 0.0,
+        position_data: Optional[dict] = None,
+    ) -> None:
+        """
+        PURPOSE: Record a detected trade closure to the database and notify components.
+
+        Shared by both DRY_RUN and LIVE close-detection paths in
+        _check_closed_positions().
+
+        Args:
+            ticket: MT5 or simulated ticket number.
+            trade_info: Dict from self._open_trades (contains trade_id, strategy_code, etc.).
+            exit_price: Exit price to record (0 if unknown).
+            position_data: Optional raw position data from MT5 history (LIVE only).
+
+        CALLED BY: _check_closed_positions
+        """
+        trade_id = trade_info['trade_id']
+        strategy_code = trade_info['strategy_code']
+
+        try:
+            profit = 0.0
+            commission = 0.0
+            swap = 0.0
+
+            if position_data:
+                exit_price = position_data.get('price', exit_price)
+                profit = position_data.get('profit', 0.0)
+                commission = position_data.get('commission', 0.0)
+                swap = position_data.get('swap', 0.0)
+
+            async with AsyncSessionLocal() as session:
+                stmt = select(TradeModel).where(TradeModel.id == trade_id)
+                result = await session.execute(stmt)
+                trade_obj = result.scalar_one_or_none()
+
+                if trade_obj:
+                    await TradeService.close_trade(
+                        session, trade_id,
+                        exit_price=exit_price,
+                        profit=profit,
+                        commission=commission,
+                        swap=swap
+                    )
+
+                    # Update strategy performance
+                    try:
+                        stmt = select(TradeModel).where(TradeModel.id == trade_id)
+                        result = await session.execute(stmt)
+                        closed_trade = result.scalar_one_or_none()
+                        if closed_trade:
+                            await StrategyService.update_strategy_performance(
+                                session, strategy_code, closed_trade
+                            )
+                    except Exception as perf_err:
+                        logger.warning("strategy_perf_update_failed", error=str(perf_err))
+
+                    # Update risk manager with closed trade P&L
+                    try:
+                        net_profit = profit - commission - swap
+                        await self._risk_manager.post_trade_update(net_profit, trade_info.get('symbol', ''))
+                    except Exception as risk_err:
+                        logger.warning("post_trade_risk_update_failed", error=str(risk_err))
+
+                    # Notify Brain about the completed trade
+                    try:
+                        net_profit = profit - commission - swap
+                        brain = get_brain()
+                        brain.process_trade_result({
+                            "strategy": f"{trade_info['symbol']}_{strategy_code}",
+                            "symbol": trade_info['symbol'],
+                            "direction": trade_info['direction'],
+                            "entry_price": trade_obj.entry_price,
+                            "exit_price": exit_price,
+                            "profit": net_profit,
+                            "won": net_profit > 0,
+                            "ticket": ticket,
+                        })
+                    except Exception as brain_err:
+                        logger.warning("brain_close_notify_error", error=str(brain_err))
+
+                    # Publish TRADE_CLOSED event to the event bus
+                    try:
+                        net_profit = profit - commission - swap
+                        await self._event_bus.publish(
+                            "TRADE_CLOSED",
+                            data={
+                                "trade_id": str(trade_id),
+                                "strategy_code": strategy_code,
+                                "symbol": trade_info.get("symbol"),
+                                "profit": profit,
+                                "net_profit": net_profit,
+                            },
+                            source="engine.orchestrator",
+                            severity="INFO"
+                        )
+                    except Exception as pub_err:
+                        logger.warning("trade_closed_event_publish_failed", error=str(pub_err))
+
+                    logger.info(
+                        "trade_closed_detected",
+                        ticket=ticket,
+                        strategy=strategy_code,
+                        profit=profit,
+                        exit_price=exit_price,
+                    )
+
+        except Exception as close_err:
+            logger.error("trade_close_processing_failed", ticket=ticket, error=str(close_err))
 
     @property
     def is_running(self) -> bool:

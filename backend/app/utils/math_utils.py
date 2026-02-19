@@ -86,7 +86,9 @@ def calculate_pip_value(symbol: str, lots: float) -> float:
     pip_values = {
         "XAUUSD": 10.0,
         "EURUSD": 10.0,
+        "GBPUSD": 10.0,   # Standard pip = 0.0001, $10 per standard lot
         "BTCUSD": 1.0,
+        "USDJPY": 6.67,   # JPY pip = 0.01, ~$6.67 per standard lot at ~150 USD/JPY
     }
 
     base_pip = pip_values.get(symbol, 10.0)

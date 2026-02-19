@@ -5,6 +5,7 @@ Provides endpoints for health checks, version information, dashboard summary,
 kill switch controls, and system status monitoring.
 """
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Optional
@@ -177,8 +178,13 @@ async def _build_dashboard(db: AsyncSession) -> dict:
     version_data = get_version()
     version = version_data.get("version", "1.0.0")
 
-    # ── MT5 Account ──
-    mt5_account = await _mt5_request("/account")
+    # ── MT5 requests in parallel ──
+    mt5_account, positions_raw, symbols_raw = await asyncio.gather(
+        _mt5_request("/account"),
+        _mt5_request("/positions"),
+        _mt5_request("/symbols"),
+    )
+
     account_data = None
     try:
         if mt5_account and "balance" in mt5_account:
@@ -218,10 +224,8 @@ async def _build_dashboard(db: AsyncSession) -> dict:
         except Exception:
             pass
 
-    # ── Positions ──
-    positions = await _mt5_request("/positions")
-    if not isinstance(positions, list):
-        positions = []
+    # ── Positions (already fetched in parallel above) ──
+    positions = positions_raw if isinstance(positions_raw, list) else []
 
     # ── Strategies from DB ──
     strategies_data = []
@@ -292,9 +296,8 @@ async def _build_dashboard(db: AsyncSession) -> dict:
         except Exception:
             pass
 
-    # ── Available symbols ──
-    symbols = await _mt5_request("/symbols")
-    symbol_names = symbols if isinstance(symbols, list) else []
+    # ── Available symbols (already fetched in parallel above) ──
+    symbol_names = symbols_raw if isinstance(symbols_raw, list) else []
 
     # ── System status ──
     uptime = time.time() - _startup_time
@@ -395,6 +398,20 @@ async def reset_kill_switch(
 ) -> dict:
     """Reset kill switch and resume trading."""
     logger.info("kill_switch_reset", reset_by=current_user)
+
+    # Publish KILL_SWITCH_RESET event via the shared Redis event bus.
+    # The engine process subscribes to this channel and will call
+    # kill_switch.reset(admin_override=True) upon receiving this event.
+    try:
+        from app.events.bus import get_event_bus
+        bus = get_event_bus()
+        await bus.publish("KILL_SWITCH_RESET", {
+            "reset_by": current_user,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        logger.warning("kill_switch_reset_event_failed", error=str(e))
+
     return {
         "status": "running",
         "timestamp": datetime.utcnow().isoformat(),

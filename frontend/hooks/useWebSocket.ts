@@ -55,7 +55,8 @@ export function useWebSocket(): UseWebSocketResult {
     }
 
     // Construct WebSocket URL
-    const wsUrl = `${getWsBaseUrl()}/api/ws/live`;
+    // /ws/* is routed to jsr-backend:8000 by Caddy (not under /api)
+    const wsUrl = `${getWsBaseUrl()}/ws/live`;
 
     // Create or reuse WebSocket client
     if (!wsRef.current) {
@@ -125,7 +126,7 @@ export function useWebSocketClient(): WebSocketClient | null {
 
   useEffect(() => {
     if (isAuthenticated) {
-      const wsUrl = `${getWsBaseUrl()}/api/ws/live`;
+      const wsUrl = `${getWsBaseUrl()}/ws/live`;
       if (!wsRef.current) {
         wsRef.current = createWebSocketClient({
           url: wsUrl,

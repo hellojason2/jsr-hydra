@@ -16,7 +16,6 @@ dependencies = [
     "alembic",
     "pydantic-settings",
     "redis[hiredis]",
-    "mt5linux",
     "structlog",
     "numpy",
     "pandas",

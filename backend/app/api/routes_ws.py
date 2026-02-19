@@ -143,12 +143,12 @@ async def websocket_live_updates(
 
         # Subscribe to all events
         # NOTE: In production, could filter by event type based on client request
-        event_bus.on("trade_opened", event_handler)
-        event_bus.on("trade_closed", event_handler)
-        event_bus.on("regime_changed", event_handler)
-        event_bus.on("allocation_updated", event_handler)
-        event_bus.on("kill_switch_triggered", event_handler)
-        event_bus.on("daily_loss_limit_reached", event_handler)
+        event_bus.on("TRADE_OPENED", event_handler)
+        event_bus.on("TRADE_CLOSED", event_handler)
+        event_bus.on("REGIME_CHANGED", event_handler)
+        event_bus.on("ALLOCATION_CHANGED", event_handler)
+        event_bus.on("KILL_SWITCH_TRIGGERED", event_handler)
+        event_bus.on("DAILY_LIMIT_HIT", event_handler)
 
         # Listen for client messages (heartbeat, subscriptions, etc)
         while True:
@@ -227,6 +227,41 @@ async def websocket_live_updates(
             client_id=client_id,
             remaining_clients=len(_connected_clients)
         )
+
+
+# ════════════════════════════════════════════════════════════════
+# Startup Registration
+# ════════════════════════════════════════════════════════════════
+
+
+async def setup_ws_event_handlers(bus) -> None:
+    """
+    PURPOSE: Register WebSocket broadcast handlers on the event bus so all
+    connected clients receive real-time updates for key trading events.
+
+    CALLED BY: main.py on_startup after event_bus is connected.
+
+    Args:
+        bus: EventBus instance to register handlers with.
+
+    Returns:
+        None
+    """
+
+    async def ws_trade_handler(payload: EventPayload) -> None:
+        """Forward trade events to all connected WebSocket clients."""
+        await broadcast_event(payload)
+
+    async def ws_regime_handler(payload: EventPayload) -> None:
+        """Forward regime-change events to all connected WebSocket clients."""
+        await broadcast_event(payload)
+
+    bus.on("TRADE_OPENED", ws_trade_handler)
+    bus.on("TRADE_CLOSED", ws_trade_handler)
+    bus.on("REGIME_CHANGED", ws_regime_handler)
+    bus.on("KILL_SWITCH_TRIGGERED", ws_trade_handler)
+
+    logger.info("ws_event_handlers_registered")
 
 
 # ════════════════════════════════════════════════════════════════

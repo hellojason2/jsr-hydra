@@ -17,7 +17,8 @@ from app.utils.logger import get_logger
 
 logger = get_logger("brain.memory")
 
-MEMORY_FILE_PATH = "/tmp/jsr_brain_memory.json"
+MEMORY_FILE_PATH = "/app/data/brain/memory.json"
+os.makedirs(os.path.dirname(MEMORY_FILE_PATH), exist_ok=True)
 
 
 def get_memory_path() -> str:

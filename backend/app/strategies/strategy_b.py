@@ -75,6 +75,7 @@ class StrategyB(BaseStrategy):
         self._grid_levels = config.get('grid_levels', 5)
         self._grid_spacing_pct = config.get('grid_spacing_pct', 0.5)
         self._lookback = config.get('lookback', 50)
+        self._bb_period = config.get('bb_period', 20)
         self._z_score_threshold = config.get('z_score_threshold', 1.3)
         self._timeframe = config.get('timeframe', 'H1')
         self._default_lots = config.get('default_lots', 1.0)
@@ -84,6 +85,7 @@ class StrategyB(BaseStrategy):
             grid_levels=self._grid_levels,
             grid_spacing_pct=self._grid_spacing_pct,
             lookback=self._lookback,
+            bb_period=self._bb_period,
             z_score_threshold=self._z_score_threshold
         )
 
@@ -120,10 +122,10 @@ class StrategyB(BaseStrategy):
                 return None
 
             # Calculate SMA (mean)
-            sma = candles_df['close'].rolling(window=20, min_periods=1).mean()
+            sma = candles_df['close'].rolling(window=self._bb_period, min_periods=1).mean()
 
             # Calculate standard deviation for Bollinger Bands
-            std = candles_df['close'].rolling(window=20, min_periods=1).std()
+            std = candles_df['close'].rolling(window=self._bb_period, min_periods=1).std()
 
             # Calculate Bollinger Bands
             upper_band = sma + 2 * std
@@ -311,6 +313,7 @@ class StrategyB(BaseStrategy):
             'grid_levels': self._grid_levels,
             'grid_spacing_pct': self._grid_spacing_pct,
             'lookback': self._lookback,
+            'bb_period': self._bb_period,
             'z_score_threshold': self._z_score_threshold,
             'timeframe': self._timeframe,
             'default_lots': self._default_lots,

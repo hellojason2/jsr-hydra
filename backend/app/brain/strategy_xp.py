@@ -20,7 +20,9 @@ from app.utils.logger import get_logger
 logger = get_logger("brain.strategy_xp")
 
 # Persistence path
-XP_STATE_PATH = "/tmp/jsr_strategy_xp.json"
+XP_STATE_PATH = "/app/data/brain/strategy_xp.json"
+import os as _os
+_os.makedirs(_os.path.dirname(XP_STATE_PATH), exist_ok=True)
 
 # Strategy metadata
 STRATEGY_NAMES = {
@@ -332,11 +334,14 @@ class StrategyXP:
                 "earned_at": now,
             })
 
-        # Survivor: recovered from 3+ loss streak (current streak is now a win after losses)
+        # Survivor: recovered from 3+ loss streak
+        # Use pre-update streak type (before the win resets the streak counter)
+        pre_streak_type = trade_result.get("_pre_streak_type", strategy_state.get("current_streak_type", "none"))
+        pre_streak_len = trade_result.get("_pre_streak_len", strategy_state.get("current_streak", 0))
         if ("survivor" not in current_badges
-                and strategy_state.get("worst_streak", 0) >= 3
                 and trade_result.get("won", False)
-                and strategy_state.get("current_streak_type") == "loss"):
+                and pre_streak_type == "loss"
+                and pre_streak_len >= 3):
             new_badges.append({
                 "id": "survivor",
                 **self.BADGE_DEFINITIONS["survivor"],
@@ -426,6 +431,10 @@ class StrategyXP:
         duration = trade_result.get("duration_seconds", 3600)
         has_sl = trade_result.get("has_sl", True)
 
+        # Capture streak state BEFORE updating (needed for Survivor badge check)
+        pre_update_streak_type = state.get("current_streak_type", "none")
+        pre_update_streak_len = state.get("current_streak", 0)
+
         # Update trade stats BEFORE XP calculation (streak matters)
         state["total_trades"] += 1
         if won:
@@ -490,8 +499,13 @@ class StrategyXP:
         # Update skills
         state["skills_unlocked"] = self._get_skills_for_level(level)
 
+        # Inject pre-update streak info into trade_result context for Survivor badge
+        trade_result_with_context = dict(trade_result)
+        trade_result_with_context["_pre_streak_type"] = pre_update_streak_type
+        trade_result_with_context["_pre_streak_len"] = pre_update_streak_len
+
         # Check badges
-        new_badges = self._check_badges(state, trade_result)
+        new_badges = self._check_badges(state, trade_result_with_context)
         state["badges"].extend(new_badges)
 
         # Record XP event in history (keep last 50)

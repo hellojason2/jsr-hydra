@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
@@ -79,12 +79,12 @@ async def list_trades(
             filters.append(Trade.opened_at >= cutoff_date)
 
         # Execute count query
-        count_stmt = select(Trade)
+        count_stmt = select(func.count(Trade.id))
         if filters:
             count_stmt = count_stmt.where(and_(*filters))
 
         count_result = await db.execute(count_stmt)
-        total = len(count_result.scalars().all())
+        total = count_result.scalar() or 0
 
         # Execute paginated query
         offset = (page - 1) * per_page
@@ -125,150 +125,6 @@ async def list_trades(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve trades"
-        )
-
-
-@router.get("/{trade_id}", response_model=TradeResponse)
-async def get_trade(
-    trade_id: str,
-    db: AsyncSession = Depends(get_db),
-) -> TradeResponse:
-    """
-    PURPOSE: Retrieve a single trade by ID with complete details.
-
-    CALLED BY: Trade detail page, position monitoring
-
-    Args:
-        trade_id: UUID of trade to retrieve
-        current_user: Authenticated username
-        db: Database session
-
-    Returns:
-        TradeResponse: Complete trade details
-
-    Raises:
-        HTTPException: If trade not found or database error occurs
-    """
-    try:
-        stmt = select(Trade).where(Trade.id == trade_id)
-        result = await db.execute(stmt)
-        trade = result.scalar_one_or_none()
-
-        if not trade:
-            logger.warning("trade_not_found", trade_id=trade_id)
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Trade not found"
-            )
-
-        logger.info("trade_retrieved", trade_id=trade_id)
-        return TradeResponse.model_validate(trade)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(
-            "get_trade_failed",
-            trade_id=trade_id,
-            error=str(e)
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve trade"
-        )
-
-
-# ════════════════════════════════════════════════════════════════
-# Trade Creation
-# ════════════════════════════════════════════════════════════════
-
-
-@router.post("", response_model=TradeResponse)
-async def create_trade(
-    trade_data: TradeCreate,
-    current_user: str = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> TradeResponse:
-    """
-    PURPOSE: Create a new trade record in the system.
-
-    CALLED BY: Manual trade entry, external trading systems
-
-    Args:
-        trade_data: TradeCreate schema with required trade details
-        current_user: Authenticated username
-        db: Database session
-
-    Returns:
-        TradeResponse: Created trade with all details
-
-    Raises:
-        HTTPException: If trade creation fails or validation error
-    """
-    try:
-        from app.models.strategy import Strategy
-        from app.models.account import MasterAccount
-
-        # Get or create master account for API trades
-        stmt = select(MasterAccount).limit(1)
-        result = await db.execute(stmt)
-        master = result.scalar_one_or_none()
-        if not master:
-            master = MasterAccount(mt5_login=0, broker="API", status="RUNNING")
-            db.add(master)
-            await db.flush()
-
-        # Resolve strategy_code to strategy_id
-        strategy_id = None
-        if trade_data.strategy_code:
-            stmt = select(Strategy).where(Strategy.code == trade_data.strategy_code)
-            result = await db.execute(stmt)
-            strategy = result.scalar_one_or_none()
-            if strategy:
-                strategy_id = strategy.id
-
-        new_trade = Trade(
-            master_id=master.id,
-            strategy_id=strategy_id,
-            symbol=trade_data.symbol,
-            direction=trade_data.direction.upper(),
-            lots=trade_data.lots,
-            entry_price=trade_data.entry_price,
-            stop_loss=trade_data.stop_loss,
-            take_profit=trade_data.take_profit,
-            reason=trade_data.reason,
-            status="OPEN",
-            profit=0.0,
-            commission=0.0,
-            swap=0.0,
-            net_profit=0.0,
-            is_simulated=False,
-            opened_at=datetime.utcnow(),
-        )
-
-        db.add(new_trade)
-        await db.commit()
-        await db.refresh(new_trade)
-
-        logger.info(
-            "trade_created",
-            trade_id=str(new_trade.id),
-            symbol=new_trade.symbol,
-            direction=new_trade.direction
-        )
-
-        return TradeResponse.model_validate(new_trade)
-
-    except Exception as e:
-        await db.rollback()
-        logger.error(
-            "trade_creation_failed",
-            error=str(e),
-            symbol=trade_data.symbol
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create trade"
         )
 
 
@@ -356,7 +212,7 @@ async def get_trade_stats(
         max_drawdown = 0.0
         running_max = 0.0
         cumulative = 0.0
-        for trade in sorted(trades, key=lambda t: t.closed_at):
+        for trade in sorted(trades, key=lambda t: t.closed_at or datetime.min):
             cumulative += trade.net_profit
             if cumulative > running_max:
                 running_max = cumulative
@@ -400,4 +256,149 @@ async def get_trade_stats(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to calculate trade statistics"
+        )
+
+
+@router.get("/{trade_id}", response_model=TradeResponse)
+async def get_trade(
+    trade_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> TradeResponse:
+    """
+    PURPOSE: Retrieve a single trade by ID with complete details.
+
+    CALLED BY: Trade detail page, position monitoring
+
+    Args:
+        trade_id: UUID of trade to retrieve
+        current_user: Authenticated username
+        db: Database session
+
+    Returns:
+        TradeResponse: Complete trade details
+
+    Raises:
+        HTTPException: If trade not found or database error occurs
+    """
+    try:
+        stmt = select(Trade).where(Trade.id == trade_id)
+        result = await db.execute(stmt)
+        trade = result.scalar_one_or_none()
+
+        if not trade:
+            logger.warning("trade_not_found", trade_id=trade_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Trade not found"
+            )
+
+        logger.info("trade_retrieved", trade_id=trade_id)
+        return TradeResponse.model_validate(trade)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "get_trade_failed",
+            trade_id=trade_id,
+            error=str(e)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve trade"
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# Trade Creation
+# ════════════════════════════════════════════════════════════════
+
+
+@router.post("", response_model=TradeResponse)
+async def create_trade(
+    trade_data: TradeCreate,
+    current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TradeResponse:
+    """
+    PURPOSE: Create a new trade record in the system.
+
+    CALLED BY: Manual trade entry, external trading systems
+
+    Args:
+        trade_data: TradeCreate schema with required trade details
+        current_user: Authenticated username
+        db: Database session
+
+    Returns:
+        TradeResponse: Created trade with all details
+
+    Raises:
+        HTTPException: If trade creation fails or validation error
+    """
+    try:
+        from app.models.strategy import Strategy
+        from app.models.account import MasterAccount
+        from app.config.settings import settings
+
+        # Get or create master account for API trades
+        stmt = select(MasterAccount).limit(1)
+        result = await db.execute(stmt)
+        master = result.scalar_one_or_none()
+        if not master:
+            master = MasterAccount(mt5_login=settings.MT5_LOGIN or 99999, broker="API", status="RUNNING")
+            db.add(master)
+            await db.flush()
+
+        # Resolve strategy_code to strategy_id
+        strategy_id = None
+        if trade_data.strategy_code:
+            stmt = select(Strategy).where(Strategy.code == trade_data.strategy_code)
+            result = await db.execute(stmt)
+            strategy = result.scalar_one_or_none()
+            if strategy:
+                strategy_id = strategy.id
+
+        new_trade = Trade(
+            master_id=master.id,
+            strategy_id=strategy_id,
+            symbol=trade_data.symbol,
+            direction=trade_data.direction.upper(),
+            lots=trade_data.lots,
+            entry_price=trade_data.entry_price,
+            stop_loss=trade_data.stop_loss,
+            take_profit=trade_data.take_profit,
+            reason=trade_data.reason,
+            status="OPEN",
+            profit=0.0,
+            commission=0.0,
+            swap=0.0,
+            net_profit=0.0,
+            is_simulated=False,
+            opened_at=datetime.utcnow(),
+        )
+
+        db.add(new_trade)
+        await db.commit()
+        await db.refresh(new_trade)
+
+        logger.info(
+            "trade_created",
+            trade_id=str(new_trade.id),
+            symbol=new_trade.symbol,
+            direction=new_trade.direction
+        )
+
+        return TradeResponse.model_validate(new_trade)
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(
+            "trade_creation_failed",
+            error=str(e),
+            symbol=trade_data.symbol
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create trade"
         )

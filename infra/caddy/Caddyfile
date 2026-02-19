@@ -1,5 +1,6 @@
 :80 {
 	reverse_proxy /api/* jsr-backend:8000
+	reverse_proxy /ws/* jsr-backend:8000
 	reverse_proxy * jsr-frontend:3000
 
 	header X-Content-Type-Options nosniff

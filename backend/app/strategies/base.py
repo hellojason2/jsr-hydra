@@ -153,7 +153,8 @@ class BaseStrategy(ABC):
         )
 
         try:
-            asyncio.ensure_future(self._event_bus.publish(
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._event_bus.publish(
                 event_type="STRATEGY_STARTED",
                 data={
                     "strategy_code": self._code.value,
@@ -162,6 +163,8 @@ class BaseStrategy(ABC):
                 },
                 source=f"strategies.{self._code.value.lower()}"
             ))
+        except RuntimeError:
+            pass  # No running event loop
         except Exception as e:
             logger.error(
                 "failed_to_publish_strategy_started",
@@ -209,7 +212,8 @@ class BaseStrategy(ABC):
         )
 
         try:
-            asyncio.ensure_future(self._event_bus.publish(
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._event_bus.publish(
                 event_type="STRATEGY_PAUSED",
                 data={
                     "strategy_code": self._code.value,
@@ -218,6 +222,8 @@ class BaseStrategy(ABC):
                 },
                 source=f"strategies.{self._code.value.lower()}"
             ))
+        except RuntimeError:
+            pass  # No running event loop
         except Exception as e:
             logger.error(
                 "failed_to_publish_strategy_paused",

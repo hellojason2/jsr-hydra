@@ -238,10 +238,10 @@ class RiskManager:
             else:
                 position_size = requested_lots
 
-            # Cap position size at MAX_TEST_LOTS for safety
-            if position_size > MAX_TEST_LOTS:
+            # Cap position size at MAX_TEST_LOTS only in dry-run/test mode
+            if settings.DRY_RUN and position_size > MAX_TEST_LOTS:
                 logger.info(
-                    "position_size_capped",
+                    "position_size_capped_dry_run",
                     original=position_size,
                     capped_to=MAX_TEST_LOTS,
                     **result_dict
@@ -486,6 +486,6 @@ class RiskManager:
         Returns:
             bool: True if symbol trades on weekends.
         """
-        # Crypto and commodities trade 24/5
-        weekend_safe_symbols = ["BTCUSD", "ETHUSD", "XAUUSD"]
+        # Only crypto trades 24/7; XAUUSD follows forex weekend schedule
+        weekend_safe_symbols = ["BTCUSD", "ETHUSD"]
         return symbol.upper() in weekend_safe_symbols

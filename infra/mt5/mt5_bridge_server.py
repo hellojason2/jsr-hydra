@@ -4,6 +4,7 @@ MetaTrader5 pip package works natively here (Wine = Windows Python).
 NO rpyc, NO mt5linux — direct MetaTrader5 API calls.
 """
 import json
+import os
 import time
 import logging
 from datetime import datetime
@@ -28,8 +29,10 @@ def ensure_mt5():
         if not mt5.initialize():
             log.error(f"MT5 initialize failed: {mt5.last_error()}")
             return False
-        # Auto-login with hardcoded credentials (demo account)
-        if not mt5.login(377439, password="Abcde12345@", server="Monaxa-MT5"):
+        login = int(os.environ.get("MT5_LOGIN", 0))
+        password = os.environ.get("MT5_PASSWORD", "")
+        server = os.environ.get("MT5_SERVER", "")
+        if not mt5.login(login, password=password, server=server):
             log.error(f"MT5 login failed: {mt5.last_error()}")
             return False
         info = mt5.account_info()

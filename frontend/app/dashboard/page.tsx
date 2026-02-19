@@ -40,7 +40,11 @@ export default function DashboardPage() {
           const data = await dashRes.value.json()
           setDashboardData(data)
         } else if (dashRes.value.status === 401 || dashRes.value.status === 403) {
-          setError('Authentication required. Please log in again.')
+          // Clear stale auth state and redirect to login
+          localStorage.removeItem('auth_token')
+          localStorage.removeItem('app-store')
+          window.location.href = '/login'
+          return
         } else if (!dashboardData) {
           // Only set error if we have no previous data (avoid overwriting good data on transient errors)
           setError(`Dashboard API returned ${dashRes.value.status}`)

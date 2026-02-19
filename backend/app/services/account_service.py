@@ -80,9 +80,17 @@ class AccountService:
             result = await db.execute(stmt)
             open_positions_count = result.scalar() or 0
 
-            # Calculate daily P&L
-            today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-            daily_pnl = account.equity - account.daily_start_balance
+            # Calculate daily P&L from today's closed trades
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            daily_stmt = select(func.coalesce(func.sum(Trade.net_profit), 0.0)).where(
+                and_(
+                    Trade.master_id == master_id,
+                    Trade.status == "CLOSED",
+                    Trade.closed_at >= today_start,
+                )
+            )
+            daily_result = await db.execute(daily_stmt)
+            daily_pnl = daily_result.scalar() or 0.0
 
             logger.info(
                 "account_retrieved",
@@ -367,8 +375,17 @@ class AccountService:
             if account.peak_equity > 0:
                 drawdown = ((account.peak_equity - account.equity) / account.peak_equity) * 100
 
-            # Calculate daily P&L
-            daily_pnl = account.equity - account.daily_start_balance
+            # Calculate daily P&L from today's closed trades
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            daily_stmt = select(func.coalesce(func.sum(Trade.net_profit), 0.0)).where(
+                and_(
+                    Trade.master_id == master_id,
+                    Trade.status == "CLOSED",
+                    Trade.closed_at >= today_start,
+                )
+            )
+            daily_result = await db.execute(daily_stmt)
+            daily_pnl = daily_result.scalar() or 0.0
 
             # Count open positions
             stmt = select(func.count(Trade.id)).where(

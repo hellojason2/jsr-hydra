@@ -2,7 +2,7 @@
 const nextConfig = {
   output: 'standalone',
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
   // Do NOT set NEXT_PUBLIC_API_URL or add rewrites() here.
   // All /api/* requests use relative URLs and are routed through

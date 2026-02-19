@@ -54,6 +54,26 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin"
 
+    def validate_production_settings(self) -> None:
+        """
+        PURPOSE: Enforce that sensitive defaults are not used in production.
+
+        CALLED BY: Application startup when DRY_RUN is False.
+
+        Raises:
+            ValueError: If JWT_SECRET or ADMIN_PASSWORD are still set to
+                        insecure default values.
+        """
+        if self.DRY_RUN:
+            return
+        errors = []
+        if self.JWT_SECRET == "change-me-in-production":
+            errors.append("JWT_SECRET must be changed from the default value before running in production.")
+        if self.ADMIN_PASSWORD == "admin":
+            errors.append("ADMIN_PASSWORD must be changed from the default value before running in production.")
+        if errors:
+            raise ValueError("Production settings validation failed:\n" + "\n".join(errors))
+
     class Config:
         """Pydantic model configuration."""
 

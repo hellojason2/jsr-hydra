@@ -47,7 +47,8 @@ RL_LOSS_STREAK_OVERRIDE = 4
 RL_EXPLORATION_RATE = 0.10
 
 # RL state persistence path
-RL_STATE_PATH = "/tmp/jsr_brain_rl_state.json"
+RL_STATE_PATH = "/app/data/brain/rl_state.json"
+os.makedirs(os.path.dirname(RL_STATE_PATH), exist_ok=True)
 
 # Strategy descriptions for insight generation
 STRATEGY_NAMES = {

@@ -80,6 +80,7 @@ class StrategyA(BaseStrategy):
         self._ema_fast = config.get('ema_fast', 9)
         self._ema_slow = config.get('ema_slow', 21)
         self._atr_period = config.get('atr_period', 14)
+        self._adx_period = config.get('adx_period', 14)
         self._adx_threshold = config.get('adx_threshold', 25)
         self._timeframe = config.get('timeframe', 'H1')
         self._lookback = config.get('lookback', 50)
@@ -93,6 +94,7 @@ class StrategyA(BaseStrategy):
             ema_fast=self._ema_fast,
             ema_slow=self._ema_slow,
             atr_period=self._atr_period,
+            adx_period=self._adx_period,
             adx_threshold=self._adx_threshold
         )
 
@@ -136,7 +138,7 @@ class StrategyA(BaseStrategy):
             # Calculate indicators
             ema_fast = ema(close, self._ema_fast)
             ema_slow = ema(close, self._ema_slow)
-            adx_values = adx(high, low, close, self._atr_period)
+            adx_values = adx(high, low, close, self._adx_period)
             atr_values = atr(high, low, close, self._atr_period)
 
             # Get latest values
@@ -312,6 +314,7 @@ class StrategyA(BaseStrategy):
             "ema_fast": self._ema_fast,
             "ema_slow": self._ema_slow,
             "atr_period": self._atr_period,
+            "adx_period": self._adx_period,
             "adx_threshold": self._adx_threshold,
             "timeframe": self._timeframe,
             "lookback": self._lookback,

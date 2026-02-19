@@ -170,7 +170,7 @@ export default function StrategyDetailPage() {
         const [stratRes, xpRes, tradesRes, rlRes] = await Promise.allSettled([
           fetch(`/api/strategies/${code}`, { headers }),
           fetch('/api/brain/strategy-xp', { headers }),
-          fetch(`/api/trades?strategy_code=${code}&limit=20`, { headers }),
+          fetch(`/api/trades?strategy_filter=${code}&per_page=20`, { headers }),
           fetch('/api/brain/rl-stats', { headers }),
         ])
 

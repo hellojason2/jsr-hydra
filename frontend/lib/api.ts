@@ -140,7 +140,7 @@ export async function updateStrategy(
   data: StrategyUpdate
 ): Promise<StrategyResponse> {
   return fetchApi<StrategyResponse>(`/api/strategies/${code}`, {
-    method: "PUT",
+    method: "PATCH",
     body: JSON.stringify(data),
   });
 }

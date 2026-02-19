@@ -36,16 +36,14 @@ def is_market_open(symbol: str = "XAUUSD") -> bool:
     # Friday 17:00 EST = Friday 22:00 UTC
     # Forex is closed Friday 22:00 UTC to Sunday 22:00 UTC
 
-    if current_weekday == 6:  # Sunday
-        return current_hour_utc >= 22
-    elif current_weekday == 5:  # Friday
-        return current_hour_utc < 22
-    elif current_weekday == 4:  # Thursday (or earlier in week)
-        return True
-    elif current_weekday < 4:
-        return True
-    else:
+    if current_weekday == 6:    # Sunday
+        return current_hour_utc >= 22  # Forex opens Sunday 22:00 UTC
+    elif current_weekday == 5:  # Saturday — always closed
         return False
+    elif current_weekday == 4:  # Friday
+        return current_hour_utc < 22   # Forex closes Friday 22:00 UTC
+    else:                        # Monday through Thursday
+        return True
 
 
 def is_weekend() -> bool:
