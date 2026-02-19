@@ -1,4 +1,4 @@
-:80 {
+ai.jsralgo.com {
 	reverse_proxy /api/* jsr-backend:8000
 	reverse_proxy /ws/* jsr-backend:8000
 	reverse_proxy * jsr-frontend:3000
