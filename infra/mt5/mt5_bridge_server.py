@@ -26,14 +26,11 @@ def ensure_mt5():
     try:
         import MetaTrader5 as _mt5
         mt5 = _mt5
-        if not mt5.initialize():
-            log.error(f"MT5 initialize failed: {mt5.last_error()}")
-            return False
         login = int(os.environ.get("MT5_LOGIN", 0))
         password = os.environ.get("MT5_PASSWORD", "")
         server = os.environ.get("MT5_SERVER", "")
-        if not mt5.login(login, password=password, server=server):
-            log.error(f"MT5 login failed: {mt5.last_error()}")
+        if not mt5.initialize(login=login, password=password, server=server):
+            log.error(f"MT5 initialize failed: {mt5.last_error()}")
             return False
         info = mt5.account_info()
         log.info(f"MT5 connected: {info.server}, account {info.login}, balance ${info.balance}")
