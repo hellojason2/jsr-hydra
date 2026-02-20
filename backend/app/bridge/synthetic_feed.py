@@ -29,16 +29,16 @@ SYMBOL_BASE_PRICES: Dict[str, float] = {
     "NZDUSD": 0.6150,
 }
 
-# Volatility (ATR as % of price) per symbol
+# Volatility (per-step standard deviation as fraction of price) per symbol
 SYMBOL_VOLATILITY: Dict[str, float] = {
-    "EURUSD": 0.0005,
-    "GBPUSD": 0.0007,
-    "USDJPY": 0.08,
-    "XAUUSD": 5.0,
-    "AUDUSD": 0.0005,
-    "USDCAD": 0.0005,
-    "USDCHF": 0.0005,
-    "NZDUSD": 0.0005,
+    "EURUSD": 0.0003,
+    "GBPUSD": 0.0004,
+    "USDJPY": 0.0003,
+    "XAUUSD": 0.0005,
+    "AUDUSD": 0.0003,
+    "USDCAD": 0.0003,
+    "USDCHF": 0.0003,
+    "NZDUSD": 0.0003,
 }
 
 # Timeframe to minutes mapping
@@ -152,16 +152,19 @@ class SyntheticFeed:
     def generate_tick(self, symbol: str) -> dict:
         """Generate a synthetic tick."""
         price = self._get_current_price(symbol)
-        vol = SYMBOL_VOLATILITY.get(symbol, 0.0005)
-        spread = vol * 0.5
+        # Typical spread as fraction of price
+        spread_pct = 0.00015  # ~1.5 pips for forex
+        if symbol == "XAUUSD":
+            spread_pct = 0.0003  # wider for gold
+        spread = price * spread_pct
 
         return {
-            "bid": round(price, 5),
-            "ask": round(price + spread, 5),
-            "last": round(price, 5),
+            "bid": round(price, 5 if price < 10 else 2),
+            "ask": round(price + spread, 5 if price < 10 else 2),
+            "last": round(price, 5 if price < 10 else 2),
             "time": datetime.utcnow(),
-            "spread": round(spread * 100000, 1) if price < 10 else round(spread * 100, 1),
-            "spread_raw": round(spread, 5),
+            "spread": round(spread * 100000, 1) if price < 10 else round(spread * 10, 1),
+            "spread_raw": round(spread, 5 if price < 10 else 2),
         }
 
     def get_symbols(self) -> list[str]:
