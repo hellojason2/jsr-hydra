@@ -18,9 +18,9 @@ CALLED BY:
 import asyncio
 import json
 import time
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 try:
     import redis.asyncio as redis_async
@@ -57,7 +57,23 @@ STRATEGY_NAMES = {
     "A": "Trend Following",
     "B": "Mean Reversion",
     "C": "Session Breakout",
-    "D": "Volatility Harvester",
+    "D": "Momentum Scalper",
+    "E": "Range Scalper (Sideways)",
+}
+
+LLM_SUPPORTED_PROVIDERS = ("openai", "zai")
+
+STRATEGY_CODES = tuple(STRATEGY_NAMES.keys())
+POINTS_START = 100
+POINTS_MIN = 0
+POINTS_MAX = 200
+POINT_BLOCK_THRESHOLD = 25
+POINT_TRADE_MIN_FOR_BLOCK = 5
+LOSS_DIAG_INTERVAL_SECONDS = 900
+
+LLM_MODELS_BY_PROVIDER = {
+    "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
+    "zai": ["glm-5", "glm-4.6", "glm-4.5-air"],
 }
 
 
@@ -82,6 +98,8 @@ class Brain:
     """
 
     REDIS_KEY = "jsr:brain:state"
+    LLM_CONFIG_REDIS_KEY = "jsr:brain:llm:config"
+    LLM_CONFIG_SYNC_INTERVAL = 5.0
 
     def __init__(self):
         """
@@ -102,14 +120,23 @@ class Brain:
             "bid": None,
             "ask": None,
             "indicators": {},
+            "symbols": {},
             "last_updated": None,
         }
         self._next_moves: List[Dict] = []
         self._strategy_scores: Dict[str, Dict] = {}
+        self._strategy_scores_by_symbol: Dict[str, Dict[str, Dict]] = {}
+        self._symbol_market_analysis: Dict[str, Dict[str, Any]] = {}
+        self._strategy_points: Dict[str, Dict[str, int]] = defaultdict(dict)
+        self._last_thought_price_by_symbol: Dict[str, float] = {}
         self._last_regime: Optional[str] = None
+        self._last_regime_by_symbol: Dict[str, str] = {}
         self._last_rsi_zone: Optional[str] = None
+        self._last_rsi_zone_by_symbol: Dict[str, str] = {}
         self._last_adx_zone: Optional[str] = None
+        self._last_adx_zone_by_symbol: Dict[str, str] = {}
         self._last_periodic_thought: float = 0.0
+        self._last_loss_diagnosis_time: float = 0.0
         self._cycle_count: int = 0
         self._trade_history: deque = deque(maxlen=50)
 
@@ -122,16 +149,17 @@ class Brain:
         # Initialize auto-allocation engine
         self._auto_allocator = AutoAllocator()
 
-        # Initialize LLM Brain (GPT-powered trading intelligence)
+        # Initialize LLM runtime state (actual provider/model is applied
+        # after Redis connection to allow cross-process config sync).
         self._llm: Optional[LLMBrain] = None
-        if settings.OPENAI_API_KEY:
-            self._llm = LLMBrain(
-                api_key=settings.OPENAI_API_KEY,
-                model=settings.OPENAI_MODEL,
-            )
-            logger.info("brain_llm_initialized", model=settings.OPENAI_MODEL)
-        else:
-            logger.info("brain_llm_disabled", reason="No OPENAI_API_KEY configured")
+        self._llm_provider: str = "none"
+        self._llm_model: str = ""
+        self._llm_last_error: Optional[str] = None
+        self._last_llm_config_sync: float = 0.0
+
+        # Pending parameter updates from LLM recommendations
+        # Format: {strategy_code: {param_name: new_value}}
+        self._pending_parameter_updates: Dict[str, Dict[str, Any]] = {}
 
         # Redis for cross-process state sharing (engine writes, API reads)
         # Using synchronous redis client; writes are wrapped in executor when called from async context
@@ -147,6 +175,9 @@ class Brain:
         except Exception as e:
             logger.warning("brain_redis_unavailable", error=str(e))
             self._redis = None
+
+        # Initialize LLM config from Redis if present, otherwise settings.
+        self._initialize_llm_from_runtime_config()
 
         logger.info("brain_initialized", rl_trades=self._learner._rl_total_trades)
 
@@ -200,8 +231,439 @@ class Brain:
         return None
 
     # ════════════════════════════════════════════════════════════════
+    # LLM Runtime Configuration (cross-process via Redis)
+    # ════════════════════════════════════════════════════════════════
+
+    def _normalize_provider(self, provider: Optional[str]) -> str:
+        """Normalize provider name and fall back to configured default."""
+        normalized = (provider or "").strip().lower()
+        if normalized in LLM_SUPPORTED_PROVIDERS:
+            return normalized
+
+        configured_default = (settings.BRAIN_LLM_PROVIDER or "openai").strip().lower()
+        if configured_default in LLM_SUPPORTED_PROVIDERS:
+            return configured_default
+        return "openai"
+
+    def _get_provider_api_key(self, provider: str) -> str:
+        if provider == "openai":
+            return settings.OPENAI_API_KEY
+        if provider == "zai":
+            return settings.ZAI_API_KEY
+        return ""
+
+    def _get_provider_default_model(self, provider: str) -> str:
+        if provider == "openai":
+            return settings.OPENAI_MODEL or "gpt-4o-mini"
+        if provider == "zai":
+            return settings.ZAI_MODEL or "glm-4.6"
+        return ""
+
+    def _get_provider_base_url(self, provider: str) -> str:
+        if provider == "openai":
+            return settings.OPENAI_BASE_URL
+        if provider == "zai":
+            return settings.ZAI_BASE_URL
+        return ""
+
+    def _get_supported_models(self, provider: str) -> List[str]:
+        """Return known model IDs for provider with env-configured default first."""
+        candidates = [
+            self._get_provider_default_model(provider),
+            *LLM_MODELS_BY_PROVIDER.get(provider, []),
+        ]
+        seen: set[str] = set()
+        models: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                models.append(candidate)
+        return models
+
+    def _load_llm_config_from_redis(self) -> Optional[dict]:
+        """Load shared LLM runtime config from Redis."""
+        if not self._redis:
+            return None
+        try:
+            raw = self._redis.get(self.LLM_CONFIG_REDIS_KEY)
+            if not raw:
+                return None
+            payload = json.loads(raw)
+            provider = self._normalize_provider(payload.get("provider"))
+            model = str(payload.get("model") or "").strip()
+            if not model:
+                model = self._get_provider_default_model(provider)
+            return {
+                "provider": provider,
+                "model": model,
+            }
+        except Exception as e:
+            logger.warning("brain_llm_config_load_failed", error=str(e))
+            return None
+
+    def _persist_llm_config_to_redis(self, provider: str, model: str) -> None:
+        """Persist shared LLM runtime config so API + engine stay in sync."""
+        if not self._redis:
+            return
+        try:
+            payload = {
+                "provider": provider,
+                "model": model,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._redis.set(self.LLM_CONFIG_REDIS_KEY, json.dumps(payload))
+        except Exception as e:
+            logger.warning("brain_llm_config_persist_failed", error=str(e))
+
+    def _apply_llm_config(self, provider: str, model: Optional[str], source: str) -> None:
+        """Apply provider/model config to the in-memory LLM client."""
+        normalized_provider = self._normalize_provider(provider)
+        selected_model = (model or "").strip() or self._get_provider_default_model(normalized_provider)
+
+        api_key = self._get_provider_api_key(normalized_provider)
+        if not api_key:
+            self._llm = None
+            self._llm_provider = normalized_provider
+            self._llm_model = selected_model
+            self._llm_last_error = f"{normalized_provider.upper()} API key is not configured"
+            logger.info(
+                "brain_llm_disabled",
+                provider=normalized_provider,
+                model=selected_model,
+                reason=self._llm_last_error,
+                source=source,
+            )
+            return
+
+        base_url = self._get_provider_base_url(normalized_provider)
+        self._llm = LLMBrain(
+            api_key=api_key,
+            model=selected_model,
+            provider=normalized_provider,
+            base_url=base_url,
+        )
+        self._llm_provider = normalized_provider
+        self._llm_model = selected_model
+        self._llm_last_error = None
+        logger.info(
+            "brain_llm_initialized",
+            provider=normalized_provider,
+            model=selected_model,
+            source=source,
+        )
+
+    def _initialize_llm_from_runtime_config(self) -> None:
+        """Initialize LLM client from Redis config first, else settings defaults."""
+        redis_config = self._load_llm_config_from_redis()
+        if redis_config:
+            self._apply_llm_config(
+                provider=redis_config["provider"],
+                model=redis_config["model"],
+                source="redis_bootstrap",
+            )
+            return
+
+        configured_provider = self._normalize_provider(settings.BRAIN_LLM_PROVIDER)
+        configured_model = self._get_provider_default_model(configured_provider)
+        self._apply_llm_config(
+            provider=configured_provider,
+            model=configured_model,
+            source="settings",
+        )
+        self._persist_llm_config_to_redis(
+            provider=configured_provider,
+            model=configured_model,
+        )
+
+    def _refresh_llm_config_from_redis(self, force: bool = False) -> None:
+        """Pull latest shared LLM config from Redis and apply if changed."""
+        if not self._redis:
+            return
+        now = time.time()
+        if not force and (now - self._last_llm_config_sync) < self.LLM_CONFIG_SYNC_INTERVAL:
+            return
+        self._last_llm_config_sync = now
+
+        redis_config = self._load_llm_config_from_redis()
+        if not redis_config:
+            return
+
+        redis_provider = redis_config["provider"]
+        redis_model = redis_config["model"]
+        if redis_provider == self._llm_provider and redis_model == self._llm_model:
+            return
+
+        self._apply_llm_config(
+            provider=redis_provider,
+            model=redis_model,
+            source="redis_sync",
+        )
+
+    def get_llm_config(self) -> dict:
+        """Return current and available LLM runtime options for dashboard UI."""
+        self._refresh_llm_config_from_redis(force=True)
+        providers = []
+        for provider in LLM_SUPPORTED_PROVIDERS:
+            providers.append(
+                {
+                    "provider": provider,
+                    "configured": bool(self._get_provider_api_key(provider)),
+                    "default_model": self._get_provider_default_model(provider),
+                    "base_url": self._get_provider_base_url(provider),
+                }
+            )
+
+        return {
+            "enabled": self._llm is not None,
+            "provider": self._llm_provider,
+            "model": self._llm_model,
+            "last_error": self._llm_last_error,
+            "providers": providers,
+            "models": {
+                provider: self._get_supported_models(provider)
+                for provider in LLM_SUPPORTED_PROVIDERS
+            },
+        }
+
+    def set_llm_config(self, provider: str, model: Optional[str] = None) -> dict:
+        """Update provider/model at runtime and persist for all processes."""
+        normalized_provider = (provider or "").strip().lower()
+        if normalized_provider not in LLM_SUPPORTED_PROVIDERS:
+            supported = ", ".join(LLM_SUPPORTED_PROVIDERS)
+            raise ValueError(f"Unsupported provider '{provider}'. Supported providers: {supported}")
+
+        selected_model = (model or "").strip() or self._get_provider_default_model(normalized_provider)
+        self._apply_llm_config(
+            provider=normalized_provider,
+            model=selected_model,
+            source="api",
+        )
+        self._persist_llm_config_to_redis(
+            provider=normalized_provider,
+            model=selected_model,
+        )
+        return self.get_llm_config()
+
+    # ════════════════════════════════════════════════════════════════
     # Core Processing
     # ════════════════════════════════════════════════════════════════
+
+    def _normalize_cycle_risk_checks(self, raw_risk_checks: Any) -> List[Dict[str, Any]]:
+        """Normalize risk checks into a list of dict payloads."""
+        if isinstance(raw_risk_checks, dict):
+            raw_risk_checks = [raw_risk_checks]
+        if not isinstance(raw_risk_checks, list):
+            return []
+        return [rc for rc in raw_risk_checks if isinstance(rc, dict)]
+
+    def _normalize_cycle_trades(self, raw_trades: Any) -> List[Dict[str, Any]]:
+        """Normalize trades into a list of dict payloads."""
+        if isinstance(raw_trades, dict):
+            raw_trades = [raw_trades]
+        if not isinstance(raw_trades, list):
+            return []
+        return [trade for trade in raw_trades if isinstance(trade, dict)]
+
+    def _build_risk_checks_by_strategy(
+        self,
+        risk_checks: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Index risk checks by strategy key for quick lookup in decision stage."""
+        indexed: Dict[str, Dict[str, Any]] = {}
+        for rc in risk_checks:
+            strat_key = rc.get("strategy")
+            if strat_key:
+                indexed[str(strat_key)] = rc
+        return indexed
+
+    def _process_symbol_payload(
+        self,
+        symbol_key: str,
+        symbol_payload: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Process one symbol/pair snapshot for this cycle.
+
+        Returns:
+            (snapshot, regime_change)
+              - snapshot: normalized market snapshot for this pair
+              - regime_change: optional regime transition payload
+        """
+        if not isinstance(symbol_payload, dict):
+            return None, None
+
+        symbol = str(symbol_key or "UNKNOWN").upper()
+        symbol_indicators = symbol_payload.get("indicators", {})
+        if not isinstance(symbol_indicators, dict):
+            symbol_indicators = {}
+
+        symbol_regime = symbol_payload.get("regime")
+        symbol_conf = symbol_payload.get("confidence")
+
+        snapshot = self._update_market_analysis(
+            indicators=symbol_indicators,
+            regime=symbol_regime,
+            confidence=symbol_conf,
+            symbol=symbol,
+            cycle_data=symbol_payload,
+        )
+        self._update_strategy_scores(symbol_regime, symbol_indicators, symbol=symbol)
+
+        regime_change: Optional[Dict[str, Any]] = None
+        old_symbol_regime = self._last_regime_by_symbol.get(symbol)
+        if (
+            symbol_regime is not None
+            and old_symbol_regime is not None
+            and symbol_regime != old_symbol_regime
+        ):
+            regime_change = {
+                "symbol": symbol,
+                "old": old_symbol_regime,
+                "new": symbol_regime,
+                "confidence": symbol_conf,
+                "indicators": symbol_indicators,
+            }
+        if symbol_regime is not None:
+            self._last_regime_by_symbol[symbol] = symbol_regime
+
+        # Pair-level threshold events for clearer "why" in thought stream.
+        self._check_rsi_crossing(symbol_indicators.get("rsi"), symbol=symbol)
+        self._check_adx_crossing(symbol_indicators.get("adx"), symbol=symbol)
+
+        return snapshot, regime_change
+
+    def _build_next_moves_for_symbols(
+        self,
+        symbol_snapshots: Dict[str, Dict[str, Any]],
+        signals: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build strategy next-move watchlist across all active pairs."""
+        moves: List[Dict[str, Any]] = []
+        for symbol_key, snapshot in symbol_snapshots.items():
+            symbol_signals = {
+                key: val
+                for key, val in signals.items()
+                if isinstance(key, str) and key.startswith(f"{symbol_key}_")
+            }
+            symbol_moves = generate_next_moves(
+                snapshot.get("indicators", {}),
+                snapshot.get("regime"),
+                symbol_signals,
+                symbol_key,
+            )
+            for move in symbol_moves:
+                if isinstance(move, dict):
+                    enriched_move = move.copy()
+                    enriched_move.setdefault("symbol", symbol_key)
+                    moves.append(enriched_move)
+        return moves[:50]
+
+    def _emit_new_candle_thoughts(
+        self,
+        symbol_snapshots: Dict[str, Dict[str, Any]],
+        primary_symbol: str,
+        fallback_new_candle: bool,
+    ) -> None:
+        """Emit pair-specific candle thoughts so each symbol has its own readable section."""
+        emitted = False
+        for symbol_key, snapshot in symbol_snapshots.items():
+            if not bool(snapshot.get("new_candle", False)):
+                continue
+            self._generate_candle_thought(
+                snapshot.get("indicators", {}),
+                snapshot.get("regime"),
+                snapshot.get("regime_confidence"),
+                symbol_key,
+                price=snapshot.get("bid"),
+                spread=snapshot.get("spread"),
+            )
+            emitted = True
+
+        # Safety fallback for legacy single-symbol payloads.
+        if not emitted and fallback_new_candle:
+            primary_snapshot = symbol_snapshots.get(primary_symbol)
+            if primary_snapshot:
+                self._generate_candle_thought(
+                    primary_snapshot.get("indicators", {}),
+                    primary_snapshot.get("regime"),
+                    primary_snapshot.get("regime_confidence"),
+                    primary_symbol,
+                    price=primary_snapshot.get("bid"),
+                    spread=primary_snapshot.get("spread"),
+                )
+
+    def _emit_regime_change_thoughts(
+        self,
+        regime_changes: List[Dict[str, Any]],
+        primary_symbol: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Emit regime-shift thoughts and return the primary pair change for LLM analysis."""
+        llm_regime_change: Optional[Dict[str, Any]] = None
+        for change in regime_changes:
+            self._generate_regime_change_thought(
+                change["old"],
+                change["new"],
+                change.get("confidence"),
+                symbol=change["symbol"],
+            )
+            if change["symbol"] == primary_symbol:
+                llm_regime_change = change
+        return llm_regime_change
+
+    def _build_market_data_for_llm(
+        self,
+        symbol_snapshots: Dict[str, Dict[str, Any]],
+        primary_symbol: str,
+        cycle_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build detailed multi-pair payload for LLM market analysis."""
+        primary_snapshot = symbol_snapshots.get(primary_symbol, {})
+        indicators = primary_snapshot.get("indicators", {})
+        return {
+            "symbols": list(symbol_snapshots.keys()) or cycle_data.get("symbols", [primary_symbol]),
+            "symbol_data": {
+                sym: {
+                    "regime": snap.get("regime"),
+                    "regime_confidence": snap.get("regime_confidence"),
+                    "bid": snap.get("bid"),
+                    "ask": snap.get("ask"),
+                    "spread": snap.get("spread"),
+                    "indicators": snap.get("indicators", {}),
+                }
+                for sym, snap in symbol_snapshots.items()
+            } or {primary_symbol: indicators},
+            "regime": primary_snapshot.get("regime"),
+            "adx": indicators.get("adx"),
+            "rsi": indicators.get("rsi"),
+            "balance": cycle_data.get("account", {}).get("balance", 0),
+            "open_positions": len(cycle_data.get("positions", [])),
+            "daily_pnl": cycle_data.get("account", {}).get("daily_pnl", 0),
+        }
+
+    def _schedule_llm_analyses(
+        self,
+        market_data: Dict[str, Any],
+        llm_regime_change: Optional[Dict[str, Any]],
+    ) -> None:
+        """Run LLM jobs in non-blocking mode, capturing runtime errors for dashboard visibility."""
+        if not self._llm:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                if llm_regime_change:
+                    asyncio.ensure_future(
+                        self._llm_analyze_regime_change(
+                            llm_regime_change["old"],
+                            llm_regime_change["new"],
+                            llm_regime_change.get("indicators", {}),
+                        )
+                    )
+                asyncio.ensure_future(self._llm_analyze_market(market_data))
+            else:
+                loop.run_until_complete(self._llm_analyze_market(market_data))
+        except Exception as e:
+            self._set_llm_runtime_error(str(e), context="cycle_schedule")
 
     def process_cycle(self, cycle_data: dict) -> None:
         """
@@ -218,121 +680,195 @@ class Brain:
         CALLED BY: engine/engine.py _main_loop
         """
         self._cycle_count += 1
+        self._refresh_llm_config_from_redis()
 
-        indicators = cycle_data.get("indicators", {})
-        regime = cycle_data.get("regime")
-        confidence = cycle_data.get("confidence")
-        new_candle = cycle_data.get("new_candle", False)
-        signals = cycle_data.get("signals", {})
-        risk_check = cycle_data.get("risk_check")
-        trade = cycle_data.get("trade")
-        symbol = cycle_data.get("symbol", "XAUUSD")
+        signals = cycle_data.get("signals", {}) or {}
+        if not isinstance(signals, dict):
+            signals = {}
+        risk_checks = self._normalize_cycle_risk_checks(cycle_data.get("risk_checks", []))
+        trades_this_cycle = self._normalize_cycle_trades(cycle_data.get("trades", []))
 
-        # ── Always update market analysis ──
-        self._update_market_analysis(indicators, regime, confidence, symbol, cycle_data)
+        symbols_data = cycle_data.get("symbols_data", {})
+        symbol_snapshots: Dict[str, Dict[str, Any]] = {}
+        regime_changes: List[Dict[str, Any]] = []
+        primary_symbol = str(cycle_data.get("symbol", "XAUUSD")).upper()
 
-        # ── Always update strategy scores (now RL-enhanced) ──
-        self._update_strategy_scores(regime, indicators)
+        if isinstance(symbols_data, dict) and symbols_data:
+            for raw_symbol_key, symbol_payload in symbols_data.items():
+                symbol_key = str(raw_symbol_key or "UNKNOWN").upper()
+                snapshot, regime_change = self._process_symbol_payload(symbol_key, symbol_payload)
+                if snapshot is not None:
+                    symbol_snapshots[symbol_key] = snapshot
+                if regime_change is not None:
+                    regime_changes.append(regime_change)
+            if primary_symbol not in symbol_snapshots and symbol_snapshots:
+                primary_symbol = next(iter(symbol_snapshots.keys()))
+            if symbol_snapshots:
+                self._set_primary_market_symbol(primary_symbol)
+        else:
+            fallback_payload = {
+                "indicators": cycle_data.get("indicators", {}),
+                "regime": cycle_data.get("regime"),
+                "confidence": cycle_data.get("confidence"),
+                "new_candle": cycle_data.get("new_candle", False),
+                "bid": cycle_data.get("bid"),
+                "ask": cycle_data.get("ask"),
+                "spread": cycle_data.get("spread"),
+            }
+            snapshot, regime_change = self._process_symbol_payload(primary_symbol, fallback_payload)
+            if snapshot is not None:
+                symbol_snapshots[primary_symbol] = snapshot
+            if regime_change is not None:
+                regime_changes.append(regime_change)
 
-        # ── Always update next moves ──
-        self._next_moves = generate_next_moves(indicators, regime, signals, symbol)
+        self._next_moves = self._build_next_moves_for_symbols(symbol_snapshots, signals)
 
-        # ── Decide what thoughts to generate ──
+        if not symbol_snapshots:
+            self._sync_to_redis()
+            return
 
-        # 1. New candle — always generate analysis thought
-        if new_candle:
-            self._generate_candle_thought(indicators, regime, confidence, symbol)
+        primary_snapshot = symbol_snapshots.get(primary_symbol)
+        if primary_snapshot is None:
+            primary_snapshot = next(iter(symbol_snapshots.values()))
+            primary_symbol = str(primary_snapshot.get("symbol", primary_symbol)).upper()
 
-        # 2. Signal generated — check RL override, then generate decision thought
-        for code, sig in signals.items():
-            if isinstance(sig, dict) and "direction" in sig:
-                # RL signal override check
-                if regime:
-                    should_skip, reason = self._learner.should_override_signal(
-                        code, regime, indicators
+        indicators = primary_snapshot.get("indicators", {})
+        regime = primary_snapshot.get("regime")
+        symbol = primary_symbol
+        self._strategy_scores = self._strategy_scores_by_symbol.get(primary_symbol, {})
+        risk_by_strategy = self._build_risk_checks_by_strategy(risk_checks)
+
+        logger.debug(
+            "brain_cycle_start",
+            cycle=self._cycle_count,
+            primary_symbol=primary_symbol,
+            symbols=list(symbol_snapshots.keys()),
+            signal_count=len(signals),
+            risk_checks=len(risk_checks),
+            trades=len(trades_this_cycle),
+        )
+
+        # ── 1. New candle thoughts (per pair) ──
+        self._emit_new_candle_thoughts(
+            symbol_snapshots=symbol_snapshots,
+            primary_symbol=primary_symbol,
+            fallback_new_candle=bool(cycle_data.get("new_candle", False)),
+        )
+
+        # ── 2. Signal decisions with RL + point guard ──
+        for signal_key, sig in signals.items():
+            if not (isinstance(sig, dict) and "direction" in sig):
+                continue
+
+            strategy_code, signal_symbol = self._parse_signal_key(signal_key, fallback_symbol=symbol)
+            symbol_ctx = symbol_snapshots.get(signal_symbol, primary_snapshot)
+            signal_indicators = symbol_ctx.get("indicators", indicators)
+            signal_regime = symbol_ctx.get("regime", regime)
+
+            if signal_regime:
+                should_skip, reason = self._learner.should_override_signal(
+                    strategy_code, signal_regime, signal_indicators
+                )
+                if should_skip:
+                    self._add_thought(
+                        "DECISION",
+                        (
+                            f"RL override: Skipping {STRATEGY_NAMES.get(strategy_code, strategy_code)} "
+                            f"on {signal_symbol} -- {reason}"
+                        ),
+                        confidence=0.75,
+                        metadata={
+                            "trigger": "rl_override",
+                            "strategy": strategy_code,
+                            "symbol": signal_symbol,
+                            "reason": reason,
+                        },
                     )
-                    if should_skip:
-                        self._add_thought(
-                            "DECISION",
-                            f"RL override: Skipping {STRATEGY_NAMES.get(code, code)} signal -- {reason}",
-                            confidence=0.75,
-                            metadata={
-                                "trigger": "rl_override",
-                                "strategy": code,
-                                "reason": reason,
-                            },
-                        )
-                        continue  # Skip generating normal signal thought
+                    continue
 
-                self._generate_signal_thought(code, sig, risk_check)
+            if self._should_block_signal_by_points(signal_symbol, strategy_code):
+                points = self._get_strategy_points(signal_symbol, strategy_code)
+                self._add_thought(
+                    "DECISION",
+                    (
+                        f"Point guard: Skipping {STRATEGY_NAMES.get(strategy_code, strategy_code)} "
+                        f"on {signal_symbol}. Score {points}/{POINTS_MAX} is below safety threshold."
+                    ),
+                    confidence=0.72,
+                    metadata={
+                        "trigger": "point_guard",
+                        "strategy": strategy_code,
+                        "symbol": signal_symbol,
+                        "points": points,
+                    },
+                )
+                continue
 
-        # 3. Trade executed — always generate decision thought
-        if trade is not None:
-            self._generate_trade_thought(trade, risk_check)
+            self._generate_signal_thought(
+                strategy_code,
+                sig,
+                risk_by_strategy.get(str(signal_key)),
+                symbol=signal_symbol,
+            )
 
-        # 4. Trade rejected — generate decision thought
-        if risk_check and not risk_check.get("approved", True):
-            self._generate_rejection_thought(signals, risk_check)
+        # ── 3. Trade executed thoughts from this cycle ──
+        for trade in trades_this_cycle:
+            if isinstance(trade, dict):
+                self._generate_trade_thought(
+                    trade,
+                    risk_by_strategy.get(str(trade.get("strategy"))),
+                )
 
-        # 5. Regime change — always generate analysis thought
-        if regime is not None and regime != self._last_regime and self._last_regime is not None:
-            self._generate_regime_change_thought(self._last_regime, regime, confidence)
-            # ── LLM Regime Change Analysis (non-blocking) ──
-            if self._llm:
-                old_regime_val = self._last_regime
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        asyncio.ensure_future(
-                            self._llm_analyze_regime_change(old_regime_val, regime, indicators)
-                        )
-                except Exception:
-                    pass  # Don't let LLM errors break the engine
+        # ── 4. Trade rejections ──
+        for rc in risk_by_strategy.values():
+            if not rc.get("approved", True):
+                self._generate_rejection_thought(signals, rc)
+
+        # ── 5. Regime change thoughts ──
+        llm_regime_change = self._emit_regime_change_thoughts(
+            regime_changes=regime_changes,
+            primary_symbol=primary_symbol,
+        )
         self._last_regime = regime
 
-        # 6. RSI threshold crossing (30/70)
-        self._check_rsi_crossing(indicators.get("rsi"))
-
-        # 7. ADX threshold crossing (25)
-        self._check_adx_crossing(indicators.get("adx"))
-
-        # 8. Periodic summary (every 5 minutes if nothing else happened)
+        # ── 6. Periodic summary ──
         now = time.time()
         if now - self._last_periodic_thought >= PERIODIC_SUMMARY_INTERVAL:
-            self._generate_periodic_summary(indicators, regime, symbol, cycle_data)
+            self._generate_periodic_summary(
+                indicators,
+                regime,
+                symbol,
+                cycle_data,
+                symbol_snapshots=symbol_snapshots,
+            )
             self._last_periodic_thought = now
 
-        # ── LLM Market Analysis (every 15 min, non-blocking) ──
+        # ── 7. LLM analyses (non-blocking) ──
         if self._llm:
-            market_data = {
-                "symbols": cycle_data.get("symbols", [symbol]),
-                "symbol_data": {symbol: indicators},
-                "regime": regime,
-                "adx": indicators.get("adx"),
-                "rsi": indicators.get("rsi"),
-                "balance": cycle_data.get("account", {}).get("balance", 0),
-                "open_positions": len(cycle_data.get("positions", [])),
-                "daily_pnl": 0,  # TODO: track daily P&L
-            }
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(self._llm_analyze_market(market_data))
-                else:
-                    loop.run_until_complete(self._llm_analyze_market(market_data))
-            except Exception:
-                pass  # Don't let LLM errors break the engine
+            market_data = self._build_market_data_for_llm(
+                symbol_snapshots=symbol_snapshots,
+                primary_symbol=primary_symbol,
+                cycle_data=cycle_data,
+            )
+            self._schedule_llm_analyses(
+                market_data=market_data,
+                llm_regime_change=llm_regime_change,
+            )
 
         # Sync state to Redis for cross-process access
+        logger.debug(
+            "brain_cycle_complete",
+            cycle=self._cycle_count,
+            primary_symbol=primary_symbol,
+            regime=regime,
+            thought_count=len(self._thoughts),
+            next_moves=len(self._next_moves),
+        )
         self._sync_to_redis()
 
     def process_trade_result(self, trade_data: dict) -> None:
         """
-        PURPOSE: Process a completed trade and generate learning insights.
-
-        Called when a trade closes (win or loss). Analyzes the outcome,
-        feeds it to the RL learner for Thompson Sampling updates,
-        and generates LEARNING thoughts with RL insights for future trades.
+        PURPOSE: Process trade events and learn from closed trades.
 
         Args:
             trade_data: Dict with keys: strategy, symbol, direction, lots, entry_price,
@@ -340,18 +876,43 @@ class Brain:
 
         CALLED BY: engine/engine.py (when trade closes), event handlers
         """
-        self._trade_history.append(trade_data)
+        self._refresh_llm_config_from_redis()
 
-        strategy_code = trade_data.get("strategy", "?")
+        strategy_code = str(trade_data.get("strategy", "?")).split("_")[-1].upper()
         strategy_name = STRATEGY_NAMES.get(strategy_code, f"Strategy {strategy_code}")
-        profit = trade_data.get("profit", 0)
-        net_profit = trade_data.get("net_profit", profit)
         direction = trade_data.get("direction", "?")
-        symbol = trade_data.get("symbol", "?")
+        symbol = str(trade_data.get("symbol", "?"))
         entry = trade_data.get("entry_price")
         exit_price = trade_data.get("exit_price")
         regime = trade_data.get("regime_at_entry", "unknown")
         session = trade_data.get("session", "UNKNOWN")
+
+        # Guard: engine may notify trade opens through this method.
+        # Do not poison RL with pseudo-results before a trade is closed.
+        if not self._is_closed_trade_payload(trade_data):
+            self._add_thought(
+                "DECISION",
+                (
+                    f"Trade opened: {strategy_name} ({strategy_code}) {direction} {symbol} "
+                    f"at {entry}. Awaiting closed result before RL update."
+                ),
+                confidence=0.62,
+                metadata={
+                    "trigger": "trade_opened",
+                    "strategy": strategy_code,
+                    "symbol": symbol,
+                    "ticket": trade_data.get("ticket"),
+                },
+            )
+            return
+
+        profit = trade_data.get("profit", 0)
+        net_profit = trade_data.get("net_profit", profit)
+        closed_trade = dict(trade_data)
+        closed_trade["strategy"] = strategy_code
+        closed_trade["symbol"] = symbol
+        closed_trade["net_profit"] = net_profit
+        self._trade_history.append(closed_trade)
 
         # Determine outcome
         if net_profit > 0:
@@ -390,14 +951,22 @@ class Brain:
         # Calculate RL reward for the thought
         rl_reward = self._learner.calculate_reward(learner_trade)
 
-        # Update Thompson Sampling with trade result
+        # Learner already updates Thompson Sampling internally in analyze_trade().
         preset = learner_result.get("preset", "moderate")
-        self._learner.parameter_adapter.update(strategy_code, regime, preset, rl_reward)
 
         # Get updated confidence for this strategy
         confidence_adjustments = self._learner.get_strategy_confidence_adjustments()
         strat_adj = confidence_adjustments.get(strategy_code, {})
         new_confidence = strat_adj.get("adjustment", 0.0)
+
+        points_before = self._get_strategy_points(symbol, strategy_code)
+        points_after, points_delta = self._update_strategy_points(
+            symbol=symbol,
+            strategy_code=strategy_code,
+            net_profit=net_profit,
+            rl_reward=rl_reward,
+            duration_seconds=trade_data.get("duration_seconds", 3600),
+        )
 
         # Build learning thought with RL insight
         content = (
@@ -410,6 +979,9 @@ class Brain:
         content += (
             f" Trade closed: {net_profit:+.2f}. RL reward: {rl_reward:+.4f}. "
             f"{strategy_name} confidence in {regime}: {new_confidence:+.3f}."
+        )
+        content += (
+            f" Points: {points_before} -> {points_after} ({points_delta:+d})."
         )
 
         # Analyze patterns from recent trade history for this strategy
@@ -445,6 +1017,9 @@ class Brain:
             "rl_reward": rl_reward,
             "rl_preset": preset,
             "rl_confidence_adjustment": new_confidence,
+            "points_before": points_before,
+            "points_after": points_after,
+            "points_delta": points_delta,
         })
 
         # ── Award XP (Pokemon-style leveling) ──
@@ -557,6 +1132,30 @@ class Brain:
         except Exception as e:
             logger.debug("auto_allocator_error", error=str(e))
 
+        # ── Automated loss diagnostics (point system + AI trigger) ──
+        loss_snapshot = self._build_loss_diagnostics_snapshot()
+        if self._is_losing_cluster(loss_snapshot):
+            summary = self._format_loss_summary(loss_snapshot)
+            self._add_thought(
+                "LEARNING",
+                summary,
+                confidence=0.78,
+                metadata={
+                    "trigger": "loss_diagnostics",
+                    "snapshot": loss_snapshot,
+                },
+            )
+
+            now = time.time()
+            if self._llm and (now - self._last_loss_diagnosis_time) >= LOSS_DIAG_INTERVAL_SECONDS:
+                self._last_loss_diagnosis_time = now
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.ensure_future(self._llm_diagnose_losses(loss_snapshot))
+                except Exception:
+                    pass  # Do not break trade processing on LLM failures
+
         # ── LLM Trade Review (non-blocking) ──
         if self._llm:
             llm_trade_data = {
@@ -578,6 +1177,9 @@ class Brain:
                     asyncio.ensure_future(self._llm_review_trade(llm_trade_data))
             except Exception:
                 pass  # Don't let LLM errors break the engine
+
+        # Keep API process in sync immediately after trade learning updates
+        self._sync_to_redis()
 
     # ════════════════════════════════════════════════════════════════
     # State Accessors
@@ -604,6 +1206,14 @@ class Brain:
                     code: score.copy()
                     for code, score in self._strategy_scores.items()
                 },
+                "strategy_scores_by_symbol": {
+                    sym: {code: score.copy() for code, score in scores.items()}
+                    for sym, scores in self._strategy_scores_by_symbol.items()
+                },
+                "strategy_points": {
+                    sym: points.copy()
+                    for sym, points in self._strategy_points.items()
+                },
                 "cycle_count": self._cycle_count,
                 "thought_count": len(self._thoughts),
                 "last_updated": self._market_analysis.get(
@@ -617,6 +1227,23 @@ class Brain:
                 # XP and RL data for cross-process sync
                 "strategy_xp": self._strategy_xp.get_all_xp(),
                 "rl_stats_full": self._learner.get_rl_stats(),
+                # Active LLM runtime selection
+                "llm": {
+                    "enabled": self._llm is not None,
+                    "provider": self._llm_provider,
+                    "model": self._llm_model,
+                    "last_error": self._llm_last_error,
+                },
+                # LLM outputs for cross-process dashboard reads
+                "llm_insights": self._llm.get_insights() if self._llm else [],
+                "llm_stats": self._llm.get_stats() if self._llm else {
+                    "provider": "none",
+                    "model": "none",
+                    "total_calls": 0,
+                    "total_tokens_used": 0,
+                    "estimated_cost_usd": 0,
+                    "insights_count": 0,
+                },
             }
 
         # Otherwise, try to load from Redis (engine writes, API reads)
@@ -630,12 +1257,29 @@ class Brain:
             "market_analysis": self._market_analysis.copy(),
             "next_moves": [],
             "strategy_scores": {},
+            "strategy_scores_by_symbol": {},
+            "strategy_points": {},
             "cycle_count": 0,
             "thought_count": 0,
             "last_updated": None,
             "rl_distributions": {},
             "exploration_rate": 0.10,
             "total_trades_analyzed": 0,
+            "llm": {
+                "enabled": self._llm is not None,
+                "provider": self._llm_provider,
+                "model": self._llm_model,
+                "last_error": self._llm_last_error,
+            },
+            "llm_insights": [],
+            "llm_stats": {
+                "provider": "none",
+                "model": "none",
+                "total_calls": 0,
+                "total_tokens_used": 0,
+                "estimated_cost_usd": 0,
+                "insights_count": 0,
+            },
         }
 
     def _get_redis_state(self) -> Optional[dict]:
@@ -759,50 +1403,151 @@ class Brain:
         self._auto_allocator.set_enabled(enabled)
 
     # ════════════════════════════════════════════════════════════════
+    # Pending Parameter Updates (consumed by Engine)
+    # ════════════════════════════════════════════════════════════════
+
+    def get_pending_parameter_updates(self) -> Dict[str, Dict[str, Any]]:
+        """
+        PURPOSE: Return and clear pending parameter updates for the engine.
+
+        Returns:
+            dict: {strategy_code: {param: value}} — consumed once
+
+        CALLED BY: engine.py every 60 cycles
+        """
+        updates = self._pending_parameter_updates.copy()
+        self._pending_parameter_updates.clear()
+        return updates
+
+    def queue_parameter_update(self, strategy_code: str, param: str, value: Any) -> None:
+        """
+        PURPOSE: Queue a parameter update for a strategy.
+
+        CALLED BY: LLM trade review / loss diagnosis callbacks
+        """
+        if strategy_code not in self._pending_parameter_updates:
+            self._pending_parameter_updates[strategy_code] = {}
+        self._pending_parameter_updates[strategy_code][param] = value
+        logger.info(
+            "brain_parameter_update_queued",
+            strategy=strategy_code,
+            param=param,
+            value=value,
+        )
+
+    # ════════════════════════════════════════════════════════════════
     # LLM Async Helpers (fire-and-forget from sync process_cycle)
     # ════════════════════════════════════════════════════════════════
+
+    def _normalize_error_message(self, raw_message: Optional[str], fallback: str) -> str:
+        """Normalize error text to avoid blank dashboard messages."""
+        message = " ".join(str(raw_message or "").strip().split())
+        return message[:240] if message else fallback
+
+    def _is_llm_error_content(self, content: str) -> bool:
+        """Detect synthetic LLM error payloads emitted by LLMBrain."""
+        return str(content or "").strip().startswith("[LLM Error")
+
+    def _set_llm_runtime_error(self, raw_message: Optional[str], context: str) -> None:
+        """Expose runtime LLM failures through /llm-config last_error."""
+        normalized = self._normalize_error_message(raw_message, fallback="Unknown LLM runtime failure")
+        self._llm_last_error = f"LLM runtime error [{context}]: {normalized}"
+        logger.warning(
+            "brain_llm_runtime_error",
+            provider=self._llm_provider,
+            model=self._llm_model,
+            context=context,
+            error=normalized,
+        )
+
+    def _clear_llm_runtime_error_if_needed(self) -> None:
+        """Clear runtime errors after a successful LLM response."""
+        if self._llm_last_error and self._llm_last_error.startswith("LLM runtime error"):
+            self._llm_last_error = None
+
+    def _ingest_llm_insight(
+        self,
+        insight: Optional[Dict[str, Any]],
+        insight_type: str,
+        success_confidence: float,
+    ) -> None:
+        """Normalize and publish LLM insight into thought stream + runtime status."""
+        if not insight:
+            return
+        raw_content = insight.get("content")
+        content = str(raw_content or "").strip()
+        if not content:
+            content = "[LLM Error][EmptyResponse] Provider returned empty content."
+
+        is_error = bool(insight.get("is_error")) or self._is_llm_error_content(content)
+        if is_error:
+            self._set_llm_runtime_error(content, context=insight_type)
+        else:
+            self._clear_llm_runtime_error_if_needed()
+
+        self._add_thought(
+            "AI_INSIGHT",
+            content,
+            confidence=0.35 if is_error else success_confidence,
+            metadata={
+                "source": self._llm_provider or "llm",
+                "model": self._llm_model,
+                "type": insight_type,
+                "llm_error": is_error,
+            },
+        )
 
     async def _llm_analyze_market(self, market_data: Dict) -> None:
         """Fire LLM market analysis and add result as a thought."""
         try:
             insight = await self._llm.analyze_market(market_data)
-            if insight:
-                self._add_thought(
-                    "AI_INSIGHT",
-                    insight["content"],
-                    confidence=0.8,
-                    metadata={"source": "gpt", "type": "market_analysis"},
-                )
+            self._ingest_llm_insight(
+                insight=insight,
+                insight_type="market_analysis",
+                success_confidence=0.8,
+            )
         except Exception as e:
-            logger.debug("llm_market_analysis_failed", error=str(e))
+            self._set_llm_runtime_error(str(e), context="market_analysis")
+            logger.warning("llm_market_analysis_failed", error=str(e))
 
     async def _llm_review_trade(self, trade_data: Dict) -> None:
         """Fire LLM trade review and add result as a thought."""
         try:
             insight = await self._llm.review_trade(trade_data)
-            if insight:
-                self._add_thought(
-                    "AI_INSIGHT",
-                    insight["content"],
-                    confidence=0.75,
-                    metadata={"source": "gpt", "type": "trade_review"},
-                )
+            self._ingest_llm_insight(
+                insight=insight,
+                insight_type="trade_review",
+                success_confidence=0.75,
+            )
         except Exception as e:
-            logger.debug("llm_trade_review_failed", error=str(e))
+            self._set_llm_runtime_error(str(e), context="trade_review")
+            logger.warning("llm_trade_review_failed", error=str(e))
 
     async def _llm_analyze_regime_change(self, old_regime: str, new_regime: str, indicators: Dict) -> None:
         """Fire LLM regime change analysis and add result as a thought."""
         try:
             insight = await self._llm.analyze_regime_change(old_regime, new_regime, indicators)
-            if insight:
-                self._add_thought(
-                    "AI_INSIGHT",
-                    insight["content"],
-                    confidence=0.7,
-                    metadata={"source": "gpt", "type": "regime_analysis"},
-                )
+            self._ingest_llm_insight(
+                insight=insight,
+                insight_type="regime_analysis",
+                success_confidence=0.7,
+            )
         except Exception as e:
-            logger.debug("llm_regime_analysis_failed", error=str(e))
+            self._set_llm_runtime_error(str(e), context="regime_analysis")
+            logger.warning("llm_regime_analysis_failed", error=str(e))
+
+    async def _llm_diagnose_losses(self, loss_snapshot: Dict[str, Any]) -> None:
+        """Run an AI loss diagnosis and add the result to thought stream."""
+        try:
+            insight = await self._llm.diagnose_losses(loss_snapshot)
+            self._ingest_llm_insight(
+                insight=insight,
+                insight_type="loss_diagnosis",
+                success_confidence=0.82,
+            )
+        except Exception as e:
+            self._set_llm_runtime_error(str(e), context="loss_diagnosis")
+            logger.warning("llm_loss_diagnosis_failed", error=str(e))
 
     # ════════════════════════════════════════════════════════════════
     # Internal Thought Generation
@@ -826,12 +1571,88 @@ class Brain:
 
         CALLED BY: Internal thought generators
         """
+        thought_metadata: Dict[str, Any] = metadata.copy() if isinstance(metadata, dict) else {}
+
+        symbol_hint = thought_metadata.get("symbol") or self._market_analysis.get("symbol")
+        symbol = str(symbol_hint).upper() if symbol_hint else None
+        if symbol in {"?", "UNKNOWN", "NONE", "NULL"}:
+            market_symbol = self._market_analysis.get("symbol")
+            symbol = str(market_symbol).upper() if market_symbol else None
+
+        if symbol:
+            thought_metadata["symbol"] = symbol
+
+            symbol_snapshot = self._symbol_market_analysis.get(symbol)
+            if not symbol_snapshot:
+                all_symbols = self._market_analysis.get("symbols", {})
+                if isinstance(all_symbols, dict):
+                    snapshot = all_symbols.get(symbol)
+                    if isinstance(snapshot, dict):
+                        symbol_snapshot = snapshot
+
+            bid = thought_metadata.get("bid")
+            ask = thought_metadata.get("ask")
+            try:
+                bid = float(bid) if bid is not None else None
+            except (TypeError, ValueError):
+                bid = None
+            try:
+                ask = float(ask) if ask is not None else None
+            except (TypeError, ValueError):
+                ask = None
+
+            if symbol_snapshot:
+                if bid is None:
+                    raw_bid = symbol_snapshot.get("bid")
+                    try:
+                        bid = float(raw_bid) if raw_bid is not None else None
+                    except (TypeError, ValueError):
+                        bid = None
+                if ask is None:
+                    raw_ask = symbol_snapshot.get("ask")
+                    try:
+                        ask = float(raw_ask) if raw_ask is not None else None
+                    except (TypeError, ValueError):
+                        ask = None
+                if "regime" not in thought_metadata and symbol_snapshot.get("regime"):
+                    thought_metadata["regime"] = symbol_snapshot.get("regime")
+
+            if bid is not None:
+                thought_metadata["bid"] = bid
+            if ask is not None:
+                thought_metadata["ask"] = ask
+
+            price = thought_metadata.get("price")
+            try:
+                price = float(price) if price is not None else None
+            except (TypeError, ValueError):
+                price = None
+
+            if price is None:
+                if bid is not None and ask is not None:
+                    price = (bid + ask) / 2.0
+                else:
+                    price = bid if bid is not None else ask
+
+            if price is not None:
+                thought_metadata["price"] = price
+                previous_price = self._last_thought_price_by_symbol.get(symbol)
+                if previous_price is not None and previous_price != 0:
+                    price_change = price - previous_price
+                    thought_metadata.setdefault("price_prev", previous_price)
+                    thought_metadata.setdefault("price_change", price_change)
+                    thought_metadata.setdefault(
+                        "price_change_pct",
+                        (price_change / previous_price) * 100.0,
+                    )
+                self._last_thought_price_by_symbol[symbol] = price
+
         thought = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": thought_type,
             "content": content,
             "confidence": round(confidence, 2),
-            "metadata": metadata or {},
+            "metadata": thought_metadata,
         }
         self._thoughts.append(thought)
 
@@ -848,7 +1669,7 @@ class Brain:
         confidence: Optional[float],
         symbol: str,
         cycle_data: dict,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
         PURPOSE: Update the market analysis state from current cycle data.
 
@@ -891,7 +1712,7 @@ class Brain:
         if indicators.get("atr") is not None:
             key_levels["atr"] = indicators["atr"]
 
-        self._market_analysis = {
+        symbol_snapshot = {
             # Fields the frontend reads directly:
             "trend": trend_text,
             "momentum": momentum_text,
@@ -904,11 +1725,33 @@ class Brain:
             "symbol": symbol,
             "bid": bid,
             "ask": ask,
+            "spread": cycle_data.get("spread"),
             "indicators": indicators.copy() if indicators else {},
+            "new_candle": bool(cycle_data.get("new_candle", False)),
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
+        self._symbol_market_analysis[symbol] = symbol_snapshot
+        self._set_primary_market_symbol(symbol)
+        return symbol_snapshot
 
-    def _update_strategy_scores(self, regime: Optional[str], indicators: Dict) -> None:
+    def _set_primary_market_symbol(self, symbol: str) -> None:
+        """Set which symbol drives the top-level market_analysis payload."""
+        primary = self._symbol_market_analysis.get(symbol)
+        if not primary:
+            return
+        symbols_copy = {
+            sym: data.copy() for sym, data in self._symbol_market_analysis.items()
+        }
+        merged = primary.copy()
+        merged["symbols"] = symbols_copy
+        self._market_analysis = merged
+
+    def _update_strategy_scores(
+        self,
+        regime: Optional[str],
+        indicators: Dict,
+        symbol: str = "GLOBAL",
+    ) -> None:
         """
         PURPOSE: Recalculate per-strategy confidence scores, now factoring in
         RL-based confidence adjustments from the learner.
@@ -921,7 +1764,8 @@ class Brain:
         # Get RL confidence adjustments from the learner
         rl_adjustments = self._learner.get_strategy_confidence_adjustments()
 
-        for code in ("A", "B", "C", "D"):
+        symbol_scores: Dict[str, Dict[str, Any]] = {}
+        for code in STRATEGY_CODES:
             assessment = assess_strategy_fitness(code, regime, indicators)
             confidence = assessment["confidence"]
             reason = assessment["reason"]
@@ -937,6 +1781,13 @@ class Brain:
                 confidence = max(0.05, min(0.95, confidence + rl_delta))
                 reason += f" [RL: {rl_delta:+.3f} ({rl_reason})]"
 
+            points = self._get_strategy_points(symbol, code)
+            closed_count = self._get_closed_trade_count(symbol, code, lookback=60)
+            if closed_count >= 3:
+                point_adj = max(-0.2, min(0.2, ((points - POINTS_START) / POINTS_START) * 0.2))
+                confidence = max(0.05, min(0.95, confidence + point_adj))
+                reason += f" [Points: {points}/{POINTS_MAX} ({point_adj:+.3f})]"
+
             # Derive a status from confidence level
             if confidence >= 0.7:
                 status = "ACTIVE"
@@ -949,14 +1800,209 @@ class Brain:
             else:
                 status = "IDLE"
 
-            self._strategy_scores[code] = {
+            symbol_scores[code] = {
                 "name": STRATEGY_NAMES.get(code, f"Strategy {code}"),
                 "confidence": round(confidence, 3),
                 "reason": reason,
                 "status": status,
                 "rl_preset": rl_preset,
                 "rl_expected": rl_expected,
+                "points": points,
+                "symbol": symbol,
+                "trades_on_symbol": closed_count,
             }
+        self._strategy_scores_by_symbol[symbol] = symbol_scores
+        self._strategy_scores = symbol_scores
+
+    def _parse_signal_key(self, signal_key: Any, fallback_symbol: str) -> tuple[str, str]:
+        """Parse keys like EURUSD_A into strategy code + symbol."""
+        key_str = str(signal_key or "")
+        if "_" not in key_str:
+            return key_str.upper() or "?", fallback_symbol
+        symbol, strategy_code = key_str.rsplit("_", 1)
+        strategy_code = strategy_code.upper() or "?"
+        symbol = symbol or fallback_symbol
+        return strategy_code, symbol
+
+    def _is_closed_trade_payload(self, trade_data: Dict[str, Any]) -> bool:
+        """Return True only when payload appears to represent a closed trade."""
+        status = str(trade_data.get("status") or "").lower()
+        if status == "closed":
+            return True
+        if trade_data.get("exit_price") is not None:
+            return True
+        if "net_profit" in trade_data and trade_data.get("ticket") is not None:
+            return True
+        if "profit" in trade_data and trade_data.get("won") is not None:
+            return True
+        return False
+
+    def _get_closed_trade_count(self, symbol: str, strategy_code: str, lookback: int = 50) -> int:
+        """Count closed trades for a symbol/strategy pair over a recent window."""
+        if lookback <= 0:
+            return 0
+        symbol_upper = str(symbol).upper()
+        strategy_upper = str(strategy_code).upper()
+        count = 0
+        for trade in list(self._trade_history)[-lookback:]:
+            if not self._is_closed_trade_payload(trade):
+                continue
+            trade_symbol = str(trade.get("symbol", "")).upper()
+            trade_strategy = str(trade.get("strategy", "")).split("_")[-1].upper()
+            if trade_symbol == symbol_upper and trade_strategy == strategy_upper:
+                count += 1
+        return count
+
+    def _get_strategy_points(self, symbol: str, strategy_code: str) -> int:
+        """Get mutable point score for a symbol/strategy pair."""
+        symbol_key = str(symbol).upper()
+        strategy_key = str(strategy_code).upper()
+        if strategy_key not in self._strategy_points[symbol_key]:
+            self._strategy_points[symbol_key][strategy_key] = POINTS_START
+        return self._strategy_points[symbol_key][strategy_key]
+
+    def _update_strategy_points(
+        self,
+        symbol: str,
+        strategy_code: str,
+        net_profit: float,
+        rl_reward: float,
+        duration_seconds: int,
+    ) -> tuple[int, int]:
+        """
+        Update point score and return (new_points, delta).
+
+        Points reinforce profitable, efficient behavior and penalize repeated losses.
+        """
+        current = self._get_strategy_points(symbol, strategy_code)
+        delta = 0
+        if net_profit > 0:
+            delta = 4 + min(4, int(round(max(0.0, rl_reward))))
+            if duration_seconds and duration_seconds < 1800:
+                delta += 1
+        elif net_profit < 0:
+            delta = -5 - min(3, int(round(abs(min(0.0, rl_reward)))))
+            if duration_seconds and duration_seconds < 600:
+                delta -= 1
+        else:
+            delta = -1
+
+        updated = max(POINTS_MIN, min(POINTS_MAX, current + delta))
+        self._strategy_points[str(symbol).upper()][str(strategy_code).upper()] = updated
+        return updated, delta
+
+    def _should_block_signal_by_points(self, symbol: str, strategy_code: str) -> bool:
+        """Hard guard to prevent continued firing when symbol edge score collapses."""
+        closed_count = self._get_closed_trade_count(symbol, strategy_code, lookback=60)
+        if closed_count < POINT_TRADE_MIN_FOR_BLOCK:
+            return False
+        return self._get_strategy_points(symbol, strategy_code) <= POINT_BLOCK_THRESHOLD
+
+    def _build_loss_diagnostics_snapshot(self, lookback: int = 40) -> Dict[str, Any]:
+        """Build compact performance stats used for automated loss diagnosis."""
+        closed = [
+            t for t in self._trade_history
+            if self._is_closed_trade_payload(t)
+        ][-lookback:]
+        total_trades = len(closed)
+        wins = sum(1 for t in closed if t.get("net_profit", t.get("profit", 0)) > 0)
+        total_profit = round(sum(t.get("net_profit", t.get("profit", 0)) for t in closed), 2)
+
+        by_strategy: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"trades": 0, "wins": 0, "profit": 0.0}
+        )
+        by_symbol: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"trades": 0, "wins": 0, "profit": 0.0}
+        )
+        by_symbol_strategy: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"trades": 0, "wins": 0, "profit": 0.0}
+        )
+
+        losing_streak = 0
+        for trade in reversed(closed):
+            pnl = trade.get("net_profit", trade.get("profit", 0))
+            if pnl < 0:
+                losing_streak += 1
+            else:
+                break
+
+        for trade in closed:
+            strategy = str(trade.get("strategy", "?")).split("_")[-1].upper()
+            symbol = str(trade.get("symbol", "?")).upper()
+            pnl = float(trade.get("net_profit", trade.get("profit", 0)) or 0.0)
+            won = pnl > 0
+
+            by_strategy[strategy]["trades"] += 1
+            by_strategy[strategy]["wins"] += 1 if won else 0
+            by_strategy[strategy]["profit"] += pnl
+
+            by_symbol[symbol]["trades"] += 1
+            by_symbol[symbol]["wins"] += 1 if won else 0
+            by_symbol[symbol]["profit"] += pnl
+
+            combo = f"{symbol}:{strategy}"
+            by_symbol_strategy[combo]["trades"] += 1
+            by_symbol_strategy[combo]["wins"] += 1 if won else 0
+            by_symbol_strategy[combo]["profit"] += pnl
+
+        # Round profits for compact API payloads
+        for bucket in (by_strategy, by_symbol, by_symbol_strategy):
+            for stats in bucket.values():
+                stats["profit"] = round(stats["profit"], 2)
+
+        return {
+            "lookback": lookback,
+            "total_trades": total_trades,
+            "wins": wins,
+            "win_rate": round(wins / total_trades, 3) if total_trades else 0.0,
+            "total_profit": total_profit,
+            "losing_streak": losing_streak,
+            "by_strategy": dict(by_strategy),
+            "by_symbol": dict(by_symbol),
+            "by_symbol_strategy": dict(by_symbol_strategy),
+            "strategy_points": {
+                sym: pts.copy() for sym, pts in self._strategy_points.items()
+            },
+        }
+
+    def _is_losing_cluster(self, snapshot: Dict[str, Any]) -> bool:
+        """Decide if current performance warrants a diagnostic action."""
+        trades = snapshot.get("total_trades", 0)
+        if trades < 8:
+            return False
+        total_profit = snapshot.get("total_profit", 0.0)
+        win_rate = snapshot.get("win_rate", 0.0)
+        losing_streak = snapshot.get("losing_streak", 0)
+        return (total_profit < 0 and win_rate < 0.48) or losing_streak >= 4
+
+    def _format_loss_summary(self, snapshot: Dict[str, Any]) -> str:
+        """Create concise human-readable diagnostics for ongoing losses."""
+        combo_stats = snapshot.get("by_symbol_strategy", {})
+        worst_combo = None
+        worst_profit = 0.0
+        for combo, stats in combo_stats.items():
+            profit = float(stats.get("profit", 0.0))
+            trades = int(stats.get("trades", 0))
+            if trades < 3:
+                continue
+            if worst_combo is None or profit < worst_profit:
+                worst_combo = combo
+                worst_profit = profit
+
+        headline = (
+            f"Loss diagnostics: {snapshot.get('total_trades', 0)} closed trades, "
+            f"win rate {snapshot.get('win_rate', 0.0):.0%}, P&L {snapshot.get('total_profit', 0.0):+.2f}, "
+            f"losing streak {snapshot.get('losing_streak', 0)}."
+        )
+        if worst_combo:
+            combo_detail = combo_stats.get(worst_combo, {})
+            headline += (
+                f" Weakest edge: {worst_combo} "
+                f"({combo_detail.get('wins', 0)}/{combo_detail.get('trades', 0)} wins, "
+                f"{combo_detail.get('profit', 0.0):+.2f}). "
+                "Reducing aggression until edge recovers."
+            )
+        return headline
 
     def _generate_candle_thought(
         self,
@@ -964,51 +2010,85 @@ class Brain:
         regime: Optional[str],
         confidence: Optional[float],
         symbol: str,
+        price: Optional[float] = None,
+        spread: Optional[float] = None,
     ) -> None:
         """
         PURPOSE: Generate an ANALYSIS thought on new candle.
 
         CALLED BY: process_cycle (when new_candle is True)
         """
+        def _fmt_number(value: Any, digits: int = 2) -> Optional[str]:
+            try:
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return None
+
+        price_str = _fmt_number(price, 5)
+        spread_str = _fmt_number(spread, 5)
         rsi_val = indicators.get("rsi")
         adx_val = indicators.get("adx")
         atr_val = indicators.get("atr")
         ema_20 = indicators.get("ema_20")
         ema_50 = indicators.get("ema_50")
 
-        parts = [f"New candle on {symbol}."]
+        parts = [f"[{symbol}] Candle closed."]
+
+        if price_str is not None:
+            parts.append(f"Price: {price_str}.")
+        if spread_str is not None and spread_str != "0.00000":
+            parts.append(f"Spread: {spread_str}.")
 
         # Trend summary
         if ema_20 is not None and ema_50 is not None:
             direction = "bullish" if ema_20 > ema_50 else "bearish" if ema_20 < ema_50 else "flat"
-            parts.append(f"Trend {direction} (EMA20: {ema_20}, EMA50: {ema_50}).")
-
-        # RSI note
-        if rsi_val is not None:
-            if rsi_val <= 30:
-                parts.append(f"RSI {rsi_val} — oversold.")
-            elif rsi_val >= 70:
-                parts.append(f"RSI {rsi_val} — overbought.")
-            else:
-                parts.append(f"RSI {rsi_val}.")
-
-        # ADX note
-        if adx_val is not None:
-            strength = "strong" if adx_val >= 25 else "weak"
-            parts.append(f"ADX {adx_val} ({strength} trend).")
+            ema_20_str = _fmt_number(ema_20, 5) or str(ema_20)
+            ema_50_str = _fmt_number(ema_50, 5) or str(ema_50)
+            parts.append(f"Trend: {direction} (EMA20 {ema_20_str} vs EMA50 {ema_50_str}).")
 
         # Regime
         if regime:
             conf_pct = round(confidence * 100) if confidence else 0
-            parts.append(f"Regime: {regime} ({conf_pct}%).")
+            parts.append(f"Regime: {regime} ({conf_pct}% confidence).")
+
+        # RSI note
+        if rsi_val is not None:
+            rsi_str = _fmt_number(rsi_val, 2) or str(rsi_val)
+            if rsi_val <= 30:
+                parts.append(f"Momentum: RSI {rsi_str} (oversold).")
+            elif rsi_val >= 70:
+                parts.append(f"Momentum: RSI {rsi_str} (overbought).")
+            else:
+                parts.append(f"Momentum: RSI {rsi_str} (neutral).")
+
+        # ADX note
+        if adx_val is not None:
+            strength = "strong" if adx_val >= 25 else "weak"
+            adx_str = _fmt_number(adx_val, 2) or str(adx_val)
+            parts.append(f"Trend strength: ADX {adx_str} ({strength}).")
+
+        if atr_val is not None:
+            atr_str = _fmt_number(atr_val, 5) or str(atr_val)
+            parts.append(f"Volatility: ATR {atr_str}.")
 
         content = " ".join(parts)
         self._add_thought("ANALYSIS", content, confidence=confidence or 0.5, metadata={
             "trigger": "new_candle",
+            "symbol": symbol,
+            "price": price,
+            "spread": spread,
+            "regime": regime,
+            "regime_confidence": confidence,
             "indicators": indicators,
         })
 
-    def _generate_signal_thought(self, strategy_code: str, signal: Dict, risk_check: Optional[Dict]) -> None:
+    def _generate_signal_thought(
+        self,
+        strategy_code: str,
+        signal: Dict,
+        risk_check: Optional[Dict],
+        symbol: Optional[str] = None,
+    ) -> None:
         """
         PURPOSE: Generate a DECISION thought when a strategy produces a signal.
 
@@ -1021,7 +2101,8 @@ class Brain:
         tp = signal.get("tp")
 
         content = (
-            f"{strategy_name} ({strategy_code}) generated {direction} signal. "
+            f"{strategy_name} ({strategy_code}) generated {direction} signal"
+            f"{f' on {symbol}' if symbol else ''}. "
             f"Entry: {entry}, SL: {sl}, TP: {tp}."
         )
 
@@ -1033,6 +2114,7 @@ class Brain:
 
         self._add_thought("DECISION", content, confidence=0.7, metadata={
             "strategy": strategy_code,
+            "symbol": symbol,
             "signal": signal,
             "risk_check": risk_check,
         })
@@ -1043,20 +2125,28 @@ class Brain:
 
         CALLED BY: process_cycle (when trade is not None)
         """
-        strategy_code = trade.get("strategy", "?")
+        raw_strategy_key = str(trade.get("strategy", "?"))
+        strategy_code = raw_strategy_key.split("_")[-1].upper()
         strategy_name = STRATEGY_NAMES.get(strategy_code, f"Strategy {strategy_code}")
         direction = trade.get("direction", "?")
         lots = trade.get("lots")
         ticket = trade.get("ticket")
+        symbol = trade.get("symbol")
+        if not symbol and "_" in raw_strategy_key:
+            symbol = raw_strategy_key.rsplit("_", 1)[0]
+        symbol_part = f"{symbol} " if symbol else ""
 
         content = (
-            f"Trade EXECUTED: {strategy_name} ({strategy_code}) {direction} {lots} lots. "
+            f"Trade EXECUTED: {strategy_name} ({strategy_code}) {direction} "
+            f"{symbol_part}{lots} lots. "
             f"Ticket #{ticket}."
         )
 
         self._add_thought("DECISION", content, confidence=0.8, metadata={
             "trigger": "trade_executed",
             "trade": trade,
+            "strategy": strategy_code,
+            "symbol": symbol,
         })
 
     def _generate_rejection_thought(self, signals: Dict, risk_check: Dict) -> None:
@@ -1078,6 +2168,7 @@ class Brain:
         old_regime: str,
         new_regime: str,
         confidence: Optional[float],
+        symbol: Optional[str] = None,
     ) -> None:
         """
         PURPOSE: Generate an ANALYSIS thought on regime change.
@@ -1086,7 +2177,8 @@ class Brain:
         """
         conf_pct = round(confidence * 100) if confidence else 0
         content = (
-            f"Regime shift detected: {old_regime} -> {new_regime} ({conf_pct}% confidence). "
+            f"Regime shift detected{f' on {symbol}' if symbol else ''}: "
+            f"{old_regime} -> {new_regime} ({conf_pct}% confidence). "
             f"Adjusting strategy expectations."
         )
 
@@ -1102,9 +2194,10 @@ class Brain:
             "trigger": "regime_change",
             "old_regime": old_regime,
             "new_regime": new_regime,
+            "symbol": symbol,
         })
 
-    def _check_rsi_crossing(self, rsi_val: Optional[float]) -> None:
+    def _check_rsi_crossing(self, rsi_val: Optional[float], symbol: Optional[str] = None) -> None:
         """
         PURPOSE: Detect RSI crossing key thresholds (30, 70) and generate thoughts.
 
@@ -1121,40 +2214,62 @@ class Brain:
         else:
             current_zone = "neutral"
 
+        symbol_key = str(symbol or "GLOBAL").upper()
+        previous_zone = self._last_rsi_zone_by_symbol.get(symbol_key, self._last_rsi_zone)
+
         # Check for zone transition
-        if self._last_rsi_zone is not None and current_zone != self._last_rsi_zone:
+        if previous_zone is not None and current_zone != previous_zone:
             if current_zone == "oversold":
-                content = f"RSI crossed below 30 ({rsi_val}). Entering oversold territory — mean reversion and volatility harvester setups in play."
+                content = (
+                    f"RSI crossed below 30 ({rsi_val})"
+                    f"{f' on {symbol}' if symbol else ''}. Entering oversold territory — "
+                    "mean reversion and scalper setups are in play."
+                )
                 self._add_thought("ANALYSIS", content, confidence=0.65, metadata={
                     "trigger": "rsi_crossing",
                     "rsi": rsi_val,
                     "direction": "into_oversold",
+                    "symbol": symbol,
                 })
             elif current_zone == "overbought":
-                content = f"RSI crossed above 70 ({rsi_val}). Entering overbought territory — watching for exhaustion and reversal setups."
+                content = (
+                    f"RSI crossed above 70 ({rsi_val})"
+                    f"{f' on {symbol}' if symbol else ''}. Entering overbought territory — "
+                    "watching for exhaustion and reversal setups."
+                )
                 self._add_thought("ANALYSIS", content, confidence=0.65, metadata={
                     "trigger": "rsi_crossing",
                     "rsi": rsi_val,
                     "direction": "into_overbought",
+                    "symbol": symbol,
                 })
-            elif self._last_rsi_zone == "oversold":
-                content = f"RSI recovered above 30 ({rsi_val}). Leaving oversold — potential bounce underway."
+            elif previous_zone == "oversold":
+                content = (
+                    f"RSI recovered above 30 ({rsi_val})"
+                    f"{f' on {symbol}' if symbol else ''}. Leaving oversold — potential bounce underway."
+                )
                 self._add_thought("ANALYSIS", content, confidence=0.6, metadata={
                     "trigger": "rsi_crossing",
                     "rsi": rsi_val,
                     "direction": "out_of_oversold",
+                    "symbol": symbol,
                 })
-            elif self._last_rsi_zone == "overbought":
-                content = f"RSI dropped below 70 ({rsi_val}). Leaving overbought — momentum fading."
+            elif previous_zone == "overbought":
+                content = (
+                    f"RSI dropped below 70 ({rsi_val})"
+                    f"{f' on {symbol}' if symbol else ''}. Leaving overbought — momentum fading."
+                )
                 self._add_thought("ANALYSIS", content, confidence=0.6, metadata={
                     "trigger": "rsi_crossing",
                     "rsi": rsi_val,
                     "direction": "out_of_overbought",
+                    "symbol": symbol,
                 })
 
+        self._last_rsi_zone_by_symbol[symbol_key] = current_zone
         self._last_rsi_zone = current_zone
 
-    def _check_adx_crossing(self, adx_val: Optional[float]) -> None:
+    def _check_adx_crossing(self, adx_val: Optional[float], symbol: Optional[str] = None) -> None:
         """
         PURPOSE: Detect ADX crossing the 25 threshold and generate thoughts.
 
@@ -1165,23 +2280,30 @@ class Brain:
 
         current_zone = "trending" if adx_val >= 25 else "weak"
 
-        if self._last_adx_zone is not None and current_zone != self._last_adx_zone:
+        symbol_key = str(symbol or "GLOBAL").upper()
+        previous_zone = self._last_adx_zone_by_symbol.get(symbol_key, self._last_adx_zone)
+
+        if previous_zone is not None and current_zone != previous_zone:
             if current_zone == "trending":
                 content = (
-                    f"ADX crossed above 25 ({adx_val}). Trend is strengthening — "
+                    f"ADX crossed above 25 ({adx_val})"
+                    f"{f' on {symbol}' if symbol else ''}. Trend is strengthening — "
                     f"trend-following strategies should perform well."
                 )
             else:
                 content = (
-                    f"ADX dropped below 25 ({adx_val}). Trend is weakening — "
+                    f"ADX dropped below 25 ({adx_val})"
+                    f"{f' on {symbol}' if symbol else ''}. Trend is weakening — "
                     f"mean reversion conditions developing."
                 )
             self._add_thought("ANALYSIS", content, confidence=0.6, metadata={
                 "trigger": "adx_crossing",
                 "adx": adx_val,
                 "direction": current_zone,
+                "symbol": symbol,
             })
 
+        self._last_adx_zone_by_symbol[symbol_key] = current_zone
         self._last_adx_zone = current_zone
 
     def _generate_periodic_summary(
@@ -1190,6 +2312,7 @@ class Brain:
         regime: Optional[str],
         symbol: str,
         cycle_data: dict,
+        symbol_snapshots: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         """
         PURPOSE: Generate a periodic PLAN thought summarizing current state.
@@ -1203,10 +2326,17 @@ class Brain:
         adx_val = indicators.get("adx")
         bid = cycle_data.get("bid")
 
+        def _fmt_price(value: Any) -> Optional[str]:
+            try:
+                return f"{float(value):.5f}"
+            except (TypeError, ValueError):
+                return None
+
         parts = [f"Periodic check on {symbol}."]
 
-        if bid:
-            parts.append(f"Price at {bid}.")
+        bid_str = _fmt_price(bid)
+        if bid_str:
+            parts.append(f"Price at {bid_str}.")
 
         if regime:
             parts.append(f"Regime: {regime}.")
@@ -1216,6 +2346,19 @@ class Brain:
 
         if adx_val is not None:
             parts.append(f"ADX: {adx_val}.")
+
+        # Pair-by-pair snapshot summary for easier operational debugging.
+        if symbol_snapshots:
+            pair_summaries: List[str] = []
+            for pair, snapshot in list(symbol_snapshots.items())[:6]:
+                pair_regime = snapshot.get("regime", "UNKNOWN")
+                pair_bid_str = _fmt_price(snapshot.get("bid"))
+                if pair_bid_str:
+                    pair_summaries.append(f"{pair} {pair_regime} @{pair_bid_str}")
+                else:
+                    pair_summaries.append(f"{pair} {pair_regime}")
+            if pair_summaries:
+                parts.append("Pairs: " + "; ".join(pair_summaries) + ".")
 
         # Summarize what we're watching
         if self._next_moves:
@@ -1233,6 +2376,8 @@ class Brain:
         content = " ".join(parts)
         self._add_thought("PLAN", content, confidence=0.5, metadata={
             "trigger": "periodic_summary",
+            "symbol": symbol,
+            "pair_count": len(symbol_snapshots or {}),
             "cycle_count": self._cycle_count,
             "rl_total_trades": self._learner._rl_total_trades,
         })

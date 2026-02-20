@@ -238,6 +238,21 @@ class RiskManager:
             else:
                 position_size = requested_lots
 
+            # Apply kill switch recovery multiplier (ramps 25%→100% after reset)
+            recovery_mult = self._kill_switch.recovery_multiplier
+            if recovery_mult < 1.0:
+                original_size = position_size
+                position_size = round(position_size * recovery_mult, 2)
+                # Ensure minimum viable lot size
+                position_size = max(0.01, position_size)
+                logger.info(
+                    "position_size_recovery_scaled",
+                    original=original_size,
+                    multiplier=recovery_mult,
+                    scaled_to=position_size,
+                    **result_dict,
+                )
+
             # Cap position size at MAX_TEST_LOTS only in dry-run/test mode
             if settings.DRY_RUN and position_size > MAX_TEST_LOTS:
                 logger.info(
@@ -345,6 +360,9 @@ class RiskManager:
 
             previous_pnl = self._daily_pnl
             self._daily_pnl += trade_pnl
+
+            # Record trade for kill switch recovery ramp
+            self._kill_switch.record_recovery_trade()
 
             logger.info(
                 "post_trade_update",

@@ -12,9 +12,10 @@ CALLED BY:
 import asyncio
 import json
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
+from app.config.constants import EventType
 from app.config.settings import settings
 from app.bridge import create_bridge
 from app.bridge.connector import MT5Connector
@@ -36,18 +37,23 @@ from app.strategies.strategy_a import StrategyA
 from app.strategies.strategy_b import StrategyB
 from app.strategies.strategy_c import StrategyC
 from app.strategies.strategy_d import StrategyD
+from app.strategies.strategy_e import StrategyE
 from app.brain import get_brain
 from app.utils.logger import get_logger
 from app.utils import time_utils
 from app.services.trade_service import TradeService
 from app.services.strategy_service import StrategyService
 from app.schemas.trade import TradeCreate
-from app.models.account import MasterAccount
+from app.models.account import MasterAccount, EquitySnapshot
 from app.models.trade import Trade as TradeModel
-from sqlalchemy import select
+from sqlalchemy import select, and_, func
 
 logger = get_logger("engine.orchestrator")
 
+
+# Trades stuck in PENDING status longer than this are considered stale
+# (engine likely crashed between the two-phase write).
+STALE_PENDING_TIMEOUT_SECONDS = 60
 
 TRADING_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
 
@@ -83,7 +89,7 @@ class TradingEngine:
     risk management, and database operations. Implements the main trading loop
     that checks market conditions and executes trades based on strategy signals.
 
-    Runs ALL 4 strategies on ALL symbols simultaneously for maximum trade
+    Runs configured strategies on all symbols for high trade frequency.
     frequency.
 
     CALLED BY: engine_runner.py (entry point)
@@ -143,6 +149,45 @@ class TradingEngine:
         # Strategy pool: keyed by (symbol, strategy_code) for multi-symbol support
         self._strategies: Dict[str, BaseStrategy] = {}
 
+        # ── Self-healing additions ──
+        # Allocation map: {strategy_code: allocation_pct} from DB
+        self._allocation_map: Dict[str, float] = {}
+        self._allocation_map_cycle: int = 0  # last cycle allocation was loaded
+
+        # Auto-pause: track loss streaks per strategy code
+        self._strategy_loss_streaks: Dict[str, int] = {}
+        self._strategy_cooldown_until: Dict[str, datetime] = {}
+
+        # Trade cooldown per strategy+symbol (prevent rapid-fire)
+        self._last_trade_time: Dict[str, datetime] = {}
+        self._trade_cooldown_seconds: int = 300  # 5 minutes
+
+        # Regime-aware signal gating (loosened to allow more trading)
+        self.REGIME_STRATEGY_ALLOWED: Dict[str, List[str]] = {
+            "TRENDING_UP": ["A", "B", "C", "D"],
+            "TRENDING_DOWN": ["A", "B", "C", "D"],
+            "RANGING": ["B", "C", "D", "E"],
+            "VOLATILE": ["A", "C", "D"],
+            "TRANSITIONING": ["A", "B", "C", "D"],
+            "UNKNOWN": ["A", "B", "C", "D", "E"],
+        }
+
+        # LLM parameter update safety bounds per strategy
+        self.ALLOWED_PARAMS: Dict[str, Dict[str, tuple]] = {
+            "B": {
+                "z_score_threshold": (1.5, 3.0),
+                "adx_max_threshold": (15, 35),
+                "bb_period": (14, 30),
+            },
+            "D": {
+                "rsi_oversold": (20, 40),
+                "rsi_overbought": (60, 80),
+                "bb_std": (1.5, 3.0),
+                "bb_period": (14, 30),
+            },
+        }
+        self._llm_param_check_cycle: int = 0
+
         logger.info(
             "trading_engine_initialized",
             loop_interval=self._loop_interval,
@@ -152,7 +197,7 @@ class TradingEngine:
 
     async def _ensure_strategies_seeded(self) -> None:
         """
-        PURPOSE: Seed default strategies A, B, C, D into the DB if they don't exist.
+        PURPOSE: Seed default strategies A-E into the DB if they don't exist.
 
         Called at startup before the main trading loop so that trade recording
         never fails silently due to missing strategy rows.
@@ -167,6 +212,7 @@ class TradingEngine:
             {"code": "B", "name": "Mean Reversion", "status": "active", "allocation_pct": 25.0},
             {"code": "C", "name": "Session Breakout", "status": "active", "allocation_pct": 25.0},
             {"code": "D", "name": "Momentum Scalper", "status": "active", "allocation_pct": 25.0},
+            {"code": "E", "name": "Range Scalper (Sideways)", "status": "active", "allocation_pct": 20.0},
         ]
 
         try:
@@ -248,7 +294,7 @@ class TradingEngine:
                 except Exception as reset_err:
                     logger.error("kill_switch_reset_handler_failed", error=str(reset_err))
 
-            self._event_bus.on("KILL_SWITCH_RESET", _handle_kill_switch_reset)
+            self._event_bus.on(EventType.KILL_SWITCH_RESET.value, _handle_kill_switch_reset)
 
             # 5. Seed default strategies so trade recording never fails silently
             await self._ensure_strategies_seeded()
@@ -257,6 +303,8 @@ class TradingEngine:
             # 6. Register strategies
             self._register_strategies()
             logger.info("strategies_registered", count=len(self._strategies))
+            await self._sync_strategy_runtime_statuses()
+            logger.info("strategy_statuses_synced")
 
             # 7. Install graceful shutdown signal handlers (SIGTERM / SIGINT)
             self._running = True
@@ -271,7 +319,7 @@ class TradingEngine:
 
             # Publish engine started event
             await self._event_bus.publish(
-                event_type="ENGINE_STARTED",
+                event_type=EventType.ENGINE_STARTED.value,
                 data={
                     "timestamp": self._start_time.isoformat(),
                     "dry_run": self.settings.DRY_RUN
@@ -288,6 +336,9 @@ class TradingEngine:
 
             # 8b. Recover tracking of existing MT5 positions (after restart)
             await self._recover_open_positions()
+
+            # 8c. Clean up trades stuck in PENDING from a prior crash
+            await self._cleanup_stale_pending_trades()
 
             # 9. Run main trading loop (blocking)
             await self._main_loop()
@@ -332,7 +383,7 @@ class TradingEngine:
             # Publish shutdown event
             uptime = self.uptime_seconds
             await self._event_bus.publish(
-                event_type="ENGINE_STOPPED",
+                event_type=EventType.ENGINE_STOPPED.value,
                 data={
                     "timestamp": datetime.utcnow().isoformat(),
                     "uptime_seconds": uptime
@@ -398,7 +449,7 @@ class TradingEngine:
                 logger.warning("symbol_resolution_failed", error=str(e), fallback=self._symbols)
 
             await self._event_bus.publish(
-                event_type="MT5_CONNECTED",
+                event_type=EventType.MT5_CONNECTED.value,
                 data={"dry_run": self.settings.DRY_RUN, "symbols": self._symbols},
                 source="engine.orchestrator",
                 severity="INFO"
@@ -440,7 +491,7 @@ class TradingEngine:
 
     def _register_strategies(self) -> None:
         """
-        PURPOSE: Initialize and register ALL 4 strategies for EACH trading symbol.
+        PURPOSE: Initialize and register all configured strategies for each symbol.
 
         Creates strategy instances per-symbol with symbol-specific lot sizes
         and aggressive parameters for high trade frequency.
@@ -471,19 +522,20 @@ class TradingEngine:
                 strategy_a.start()
                 self._strategies[key_a] = strategy_a
 
-                # Strategy B — Mean Reversion Grid (loosened z-score)
+                # Strategy B — Mean Reversion Grid (z-score 1.5, ADX 30 filter, M5)
                 key_b = f"{symbol}_B"
                 strategy_b = StrategyB(
                     data_feed=self._data_feed,
                     order_manager=self._order_manager,
                     event_bus=self._event_bus,
                     config={
-                        'timeframe': 'M15',
+                        'timeframe': 'M5',
                         'lookback': 100,
                         'default_lots': lot_size,
                         'grid_levels': 5,
                         'grid_spacing_pips': 50,
-                        'z_score_threshold': 1.3,
+                        'z_score_threshold': 1.5,
+                        'adx_max_threshold': 30,
                     }
                 )
                 strategy_b.start()
@@ -506,32 +558,302 @@ class TradingEngine:
                 strategy_c.start()
                 self._strategies[key_c] = strategy_c
 
-                # Strategy D — Momentum Scalper (aggressive: loose BB+RSI, M15)
+                # Strategy D — Fast Momentum Scalper (OR logic, RSI(7), M5)
                 key_d = f"{symbol}_D"
                 strategy_d = StrategyD(
                     data_feed=self._data_feed,
                     order_manager=self._order_manager,
                     event_bus=self._event_bus,
                     config={
-                        'timeframe': 'M15',
+                        'timeframe': 'M5',
                         'lookback': 100,
                         'default_lots': lot_size,
-                        'bb_period': 14,
-                        'bb_std': 1.5,
-                        'rsi_oversold': 38,
-                        'rsi_overbought': 62,
+                        'bb_period': 20,
+                        'bb_std': 2.0,
+                        'rsi_period': 7,
+                        'rsi_oversold': 35,
+                        'rsi_overbought': 65,
                     }
                 )
                 strategy_d.start()
                 self._strategies[key_d] = strategy_d
 
-                logger.info("strategies_registered_for_symbol", symbol=symbol, strategies=[key_a, key_b, key_c, key_d])
+                # Strategy E — Sideways Range Scalper (ADX-filtered, M5)
+                key_e = f"{symbol}_E"
+                strategy_e = StrategyE(
+                    data_feed=self._data_feed,
+                    order_manager=self._order_manager,
+                    event_bus=self._event_bus,
+                    config={
+                        "timeframe": "M5",
+                        "lookback": 120,
+                        "default_lots": lot_size,
+                        "bb_period": 20,
+                        "bb_std": 2.0,
+                        "rsi_period": 9,
+                        "rsi_buy": 35,
+                        "rsi_sell": 65,
+                        "adx_period": 14,
+                        "adx_max": 20,
+                        "atr_period": 14,
+                        "sl_atr_mult": 0.8,
+                        "min_tp_atr_mult": 0.6,
+                    },
+                )
+                strategy_e.start()
+                self._strategies[key_e] = strategy_e
+
+                logger.info(
+                    "strategies_registered_for_symbol",
+                    symbol=symbol,
+                    strategies=[key_a, key_b, key_c, key_d, key_e],
+                )
 
             logger.info("all_strategies_registered", total=len(self._strategies), strategies=list(self._strategies.keys()))
 
         except Exception as e:
             logger.error("strategy_registration_failed", error=str(e))
             raise
+
+    async def _load_strategy_status_map(self) -> Dict[str, str]:
+        """
+        Load strategy status from DB keyed by strategy code (A-E).
+
+        Returns:
+            Dict[str, str]: Mapping like {"A": "active", "E": "paused"}
+        """
+        from app.models.strategy import Strategy
+
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(Strategy.code, Strategy.status))
+                rows = result.all()
+            return {
+                (code or "").upper(): (status or "paused").lower()
+                for code, status in rows
+                if code
+            }
+        except Exception as e:
+            logger.warning("strategy_status_map_load_failed", error=str(e))
+            return {}
+
+    async def _sync_strategy_runtime_statuses(self) -> None:
+        """
+        Apply DB strategy statuses to in-memory strategy instances.
+
+        This keeps live execution aligned with UI/API status toggles.
+        """
+        status_map = await self._load_strategy_status_map()
+        if not status_map:
+            return
+
+        for strategy_key, strategy in self._strategies.items():
+            strategy_code = strategy_key.rsplit("_", 1)[-1].upper()
+            desired_status = status_map.get(strategy_code, "paused")
+            should_be_active = desired_status == "active"
+
+            if should_be_active and not strategy.is_active:
+                strategy.start()
+                logger.info("strategy_runtime_activated", strategy=strategy_key)
+            elif not should_be_active and strategy.is_active:
+                strategy.pause()
+                logger.info("strategy_runtime_paused", strategy=strategy_key, desired_status=desired_status)
+
+    async def _load_strategy_allocation_map(self) -> None:
+        """
+        PURPOSE: Load allocation_pct from Strategy table into memory cache.
+        Reloaded every 60 cycles.
+
+        CALLED BY: _main_loop
+        """
+        from app.models.strategy import Strategy
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Strategy.code, Strategy.allocation_pct)
+                )
+                rows = result.all()
+            self._allocation_map = {
+                code.upper(): float(alloc or 25.0)
+                for code, alloc in rows
+                if code
+            }
+            logger.debug("allocation_map_loaded", allocations=self._allocation_map)
+        except Exception as e:
+            logger.warning("allocation_map_load_failed", error=str(e))
+
+    def _get_effective_risk_pct(self, strategy_code: str) -> float:
+        """
+        PURPOSE: Calculate effective risk percentage using allocation weighting.
+
+        Scales base RISK_PER_TRADE_PCT by strategy allocation relative to
+        equal distribution (25%).
+
+        CALLED BY: _main_loop signal processing
+        """
+        base_risk = self.settings.RISK_PER_TRADE_PCT
+        alloc = self._allocation_map.get(strategy_code.upper(), 25.0)
+        # Scale: allocation_pct / 25.0 (so 50% allocation = 2x risk, 12.5% = 0.5x)
+        effective_risk = base_risk * (alloc / 25.0)
+        return max(0.1, min(3.0, effective_risk))  # clamp to sane range
+
+    def _check_strategy_auto_pause(self, strategy_code: str) -> bool:
+        """
+        PURPOSE: Check if a strategy is auto-paused due to loss streak.
+
+        Returns True if strategy should be skipped this cycle.
+
+        CALLED BY: _main_loop signal processing
+        """
+        cooldown_until = self._strategy_cooldown_until.get(strategy_code)
+        if cooldown_until and datetime.utcnow() < cooldown_until:
+            return True
+        elif cooldown_until and datetime.utcnow() >= cooldown_until:
+            # Cooldown expired, auto-resume
+            del self._strategy_cooldown_until[strategy_code]
+            logger.info(
+                "strategy_auto_resumed",
+                strategy=strategy_code,
+            )
+        return False
+
+    def _record_trade_outcome(self, strategy_code: str, won: bool) -> None:
+        """
+        PURPOSE: Track loss streaks and trigger auto-pause after 5 consecutive losses.
+
+        CALLED BY: _process_closed_trade
+        """
+        if won:
+            self._strategy_loss_streaks[strategy_code] = 0
+            return
+
+        streak = self._strategy_loss_streaks.get(strategy_code, 0) + 1
+        self._strategy_loss_streaks[strategy_code] = streak
+
+        if streak >= 5:
+            pause_until = datetime.utcnow() + timedelta(minutes=15)
+            self._strategy_cooldown_until[strategy_code] = pause_until
+            self._strategy_loss_streaks[strategy_code] = 0
+            logger.warning(
+                "strategy_auto_paused",
+                strategy=strategy_code,
+                consecutive_losses=streak,
+                resume_at=pause_until.isoformat(),
+            )
+
+    def _check_trade_cooldown(self, strategy_code: str, symbol: str) -> bool:
+        """
+        PURPOSE: Check if a strategy+symbol pair is in cooldown (prevent rapid-fire).
+
+        Returns True if trade should be skipped.
+
+        CALLED BY: _main_loop signal processing
+        """
+        key = f"{symbol}_{strategy_code}"
+        last_time = self._last_trade_time.get(key)
+        if last_time is None:
+            return False
+        elapsed = (datetime.utcnow() - last_time).total_seconds()
+        return elapsed < self._trade_cooldown_seconds
+
+    def _record_trade_time(self, strategy_code: str, symbol: str) -> None:
+        """Record trade timestamp for cooldown tracking."""
+        key = f"{symbol}_{strategy_code}"
+        self._last_trade_time[key] = datetime.utcnow()
+
+    def _check_regime_gate(self, strategy_code: str, regime: Optional[str]) -> bool:
+        """
+        PURPOSE: Check if strategy is allowed to trade in current regime.
+
+        Returns True if strategy should be BLOCKED (not allowed).
+
+        CALLED BY: _main_loop signal processing
+        """
+        if regime is None or regime == "UNKNOWN":
+            return False  # Allow all when regime unknown
+        allowed = self.REGIME_STRATEGY_ALLOWED.get(regime, ["A", "B", "C", "D", "E"])
+        return strategy_code.upper() not in allowed
+
+    def _classify_loss_reason(
+        self, trade_obj, exit_price: float, direction: str
+    ) -> str:
+        """
+        PURPOSE: Classify why a losing trade failed.
+
+        Categories:
+        - SL_TOO_TIGHT: price moved in our favor >50% of SL distance then reversed
+        - WRONG_DIRECTION: price never moved in our favor
+        - BAD_TIMING: price moved in our favor <50% of SL distance
+
+        CALLED BY: _process_closed_trade
+        """
+        entry_price = float(trade_obj.entry_price or 0)
+        sl_price = float(trade_obj.stop_loss or 0)
+        if entry_price == 0 or sl_price == 0:
+            return "UNKNOWN"
+
+        sl_distance = abs(entry_price - sl_price)
+        if sl_distance == 0:
+            return "UNKNOWN"
+
+        if direction == "BUY":
+            favorable_move = max(0, exit_price - entry_price)
+        else:
+            favorable_move = max(0, entry_price - exit_price)
+
+        ratio = favorable_move / sl_distance
+        if ratio > 0.5:
+            return "SL_TOO_TIGHT"
+        elif ratio < 0.05:
+            return "WRONG_DIRECTION"
+        else:
+            return "BAD_TIMING"
+
+    def _apply_llm_parameter_recommendations(self) -> None:
+        """
+        PURPOSE: Check brain for pending parameter updates and apply them
+        to strategy instances with safety bounds.
+
+        CALLED BY: _main_loop every 60 cycles
+        """
+        try:
+            brain = get_brain()
+            pending = brain.get_pending_parameter_updates()
+            if not pending:
+                return
+
+            for strategy_code, updates in pending.items():
+                bounds = self.ALLOWED_PARAMS.get(strategy_code.upper(), {})
+                safe_updates = {}
+
+                for param, value in updates.items():
+                    if param not in bounds:
+                        logger.warning(
+                            "llm_param_not_in_whitelist",
+                            strategy=strategy_code,
+                            param=param,
+                        )
+                        continue
+                    min_val, max_val = bounds[param]
+                    clamped = max(min_val, min(max_val, value))
+                    safe_updates[param] = clamped
+
+                if not safe_updates:
+                    continue
+
+                # Find all strategy instances for this code and apply
+                for strat_key, strategy in self._strategies.items():
+                    code = strat_key.rsplit("_", 1)[-1].upper()
+                    if code == strategy_code.upper():
+                        applied = strategy.update_parameters(safe_updates)
+                        if applied:
+                            logger.info(
+                                "llm_params_applied",
+                                strategy=strat_key,
+                                params=applied,
+                            )
+        except Exception as e:
+            logger.warning("llm_param_apply_error", error=str(e))
 
     async def _main_loop(self) -> None:
         """
@@ -577,11 +899,23 @@ class TradingEngine:
                         await asyncio.sleep(self._loop_interval)
                         continue
 
+                    # Keep runtime strategy instances aligned with DB statuses
+                    await self._sync_strategy_runtime_statuses()
+
+                    # Reload allocation map every 60 cycles
+                    if cycle_count - self._allocation_map_cycle >= 60:
+                        await self._load_strategy_allocation_map()
+                        self._allocation_map_cycle = cycle_count
+
+                    # Apply LLM parameter recommendations every 60 cycles
+                    if cycle_count - self._llm_param_check_cycle >= 60:
+                        self._apply_llm_parameter_recommendations()
+                        self._llm_param_check_cycle = cycle_count
+
                     all_signals_summary = {}
                     all_trades = []
                     all_risk_checks = []
-                    _regime_str = "UNKNOWN"
-                    _regime_conf = 0
+                    symbols_cycle_data: Dict[str, Dict] = {}
 
                     # ========== LOOP OVER ALL SYMBOLS ==========
                     for symbol in self._symbols:
@@ -666,6 +1000,31 @@ class TradingEngine:
                                 logger.warning("candle_fetch_for_tf_failed", symbol=symbol, timeframe=tf, error=str(e))
                                 new_candle_for_tf[tf] = False
 
+                        # Build per-symbol cycle snapshot for Brain multi-symbol processing
+                        if isinstance(regime, dict):
+                            regime_str = regime.get("regime", "UNKNOWN")
+                            regime_conf = regime.get("confidence", 0)
+                        elif regime is not None and hasattr(regime, "regime"):
+                            regime_str = regime.regime.value if hasattr(regime.regime, "value") else str(regime.regime)
+                            regime_conf = getattr(regime, "confidence", 0)
+                        elif isinstance(regime, str):
+                            regime_str = regime
+                            regime_conf = 0
+                        else:
+                            regime_str = "UNKNOWN"
+                            regime_conf = 0
+
+                        symbols_cycle_data[symbol] = {
+                            "symbol": symbol,
+                            "indicators": indicator_values,
+                            "regime": regime_str,
+                            "confidence": regime_conf,
+                            "new_candle": any(new_candle_for_tf.values()),
+                            "bid": tick_data.get("bid", 0) if isinstance(tick_data, dict) else 0,
+                            "ask": tick_data.get("ask", 0) if isinstance(tick_data, dict) else 0,
+                            "spread": tick_data.get("spread", 0) if isinstance(tick_data, dict) else 0,
+                        }
+
                         # --- Run strategies for this symbol ---
                         for strat_key, strategy in symbol_strategies.items():
                             tf = strategy._config.get('timeframe', 'H1')
@@ -678,11 +1037,56 @@ class TradingEngine:
                                     all_signals_summary[strat_key] = "inactive"
                                     continue
 
+                                # Extract strategy code from key (e.g. "EURUSD_B" -> "B")
+                                strat_code = strat_key.rsplit("_", 1)[-1].upper()
+
+                                # ── Auto-pause check (5 consecutive losses → 30 min pause) ──
+                                if self._check_strategy_auto_pause(strat_code):
+                                    all_signals_summary[strat_key] = "strategy_auto_paused"
+                                    continue
+
+                                # ── Regime gate: block wrong strategies in wrong regimes ──
+                                regime_str = None
+                                if isinstance(regime, dict):
+                                    regime_str = regime.get("regime")
+                                elif regime is not None and hasattr(regime, "regime"):
+                                    regime_str = regime.regime.value if hasattr(regime.regime, "value") else str(regime.regime)
+                                elif isinstance(regime, str):
+                                    regime_str = regime
+
+                                if self._check_regime_gate(strat_code, regime_str):
+                                    all_signals_summary[strat_key] = "regime_blocked"
+                                    logger.info(
+                                        "regime_blocked",
+                                        strategy=strat_key,
+                                        regime=regime_str,
+                                        symbol=symbol,
+                                    )
+                                    continue
+
+                                # ── Trade cooldown per strategy+symbol (15 min) ──
+                                if self._check_trade_cooldown(strat_code, symbol):
+                                    all_signals_summary[strat_key] = "cooldown_active"
+                                    continue
+
                                 # Run strategy cycle to get signal
                                 signal = await strategy.run_cycle(symbol)
 
                                 if signal is None:
                                     all_signals_summary[strat_key] = "no_signal"
+                                    continue
+
+                                # ── Confidence gate: skip low-confidence signals ──
+                                signal_confidence = getattr(signal, 'confidence', 0.0)
+                                if signal_confidence < self.settings.MIN_SIGNAL_CONFIDENCE:
+                                    all_signals_summary[strat_key] = "low_confidence"
+                                    logger.info(
+                                        "low_confidence",
+                                        strategy=strat_key,
+                                        confidence=signal_confidence,
+                                        threshold=self.settings.MIN_SIGNAL_CONFIDENCE,
+                                        symbol=symbol,
+                                    )
                                     continue
 
                                 # --- ENFORCE SL/TP: auto-calculate from ATR if missing ---
@@ -746,11 +1150,13 @@ class TradingEngine:
                                     "tp": tp_price,
                                 }
 
-                                # Pre-trade risk check
+                                # Pre-trade risk check with allocation-weighted risk
+                                effective_risk_pct = self._get_effective_risk_pct(strat_code)
                                 risk_check = await self._risk_manager.pre_trade_check(
                                     symbol=signal.symbol,
                                     direction=signal.direction,
-                                    sl_distance=abs(entry_price - sl_price)
+                                    sl_distance=abs(entry_price - sl_price),
+                                    risk_pct=effective_risk_pct,
                                 )
 
                                 risk_check_info = {
@@ -771,7 +1177,7 @@ class TradingEngine:
                                         cycle=cycle_count
                                     )
                                     await self._event_bus.publish(
-                                        event_type="TRADE_REJECTED",
+                                        event_type=EventType.TRADE_REJECTED.value,
                                         data={
                                             "strategy": strat_key,
                                             "symbol": signal.symbol,
@@ -826,7 +1232,7 @@ class TradingEngine:
 
                                 # Publish trade opened event
                                 await self._event_bus.publish(
-                                    event_type="TRADE_OPENED",
+                                    event_type=EventType.TRADE_OPENED.value,
                                     data={
                                         "strategy": strat_key,
                                         "symbol": signal.symbol,
@@ -841,32 +1247,6 @@ class TradingEngine:
                                     source="engine.orchestrator",
                                     severity="INFO"
                                 )
-
-                                # Notify Brain about the trade execution
-                                try:
-                                    brain = get_brain()
-                                    # Extract just the strategy letter (e.g. "A") from strat_key (e.g. "EURUSD_A")
-                                    pure_strategy_code = strat_key.split('_')[-1] if '_' in strat_key else strat_key
-                                    # Use per-symbol regime (available from the current symbol loop iteration)
-                                    regime_str_for_brain = "UNKNOWN"
-                                    if isinstance(regime, dict):
-                                        regime_str_for_brain = regime.get("regime", "UNKNOWN")
-                                    elif regime is not None and hasattr(regime, "regime"):
-                                        regime_str_for_brain = regime.regime.value if hasattr(regime.regime, "value") else str(regime.regime)
-                                    elif isinstance(regime, str):
-                                        regime_str_for_brain = regime
-
-                                    brain.process_trade_result({
-                                        "strategy": pure_strategy_code,
-                                        "symbol": signal.symbol,
-                                        "direction": signal.direction,
-                                        "lots": risk_check.position_size,
-                                        "entry_price": order_result.get('price'),
-                                        "ticket": order_result.get('ticket'),
-                                        "regime_at_entry": regime_str_for_brain,
-                                    })
-                                except Exception as brain_err:
-                                    logger.warning("brain_trade_notify_error", error=str(brain_err))
 
                                 # --- Record trade to database ---
                                 try:
@@ -908,6 +1288,10 @@ class TradingEngine:
                                             }
 
                                         logger.info("trade_recorded_to_db", trade_id=str(db_trade.id), ticket=ticket)
+
+                                        # Record trade time for cooldown
+                                        self._record_trade_time(strat_code, symbol)
+
                                 except Exception as db_err:
                                     logger.warning("trade_db_recording_failed", error=str(db_err))
 
@@ -921,7 +1305,7 @@ class TradingEngine:
                                     cycle=cycle_count
                                 )
                                 await self._event_bus.publish(
-                                    event_type="STRATEGY_ERROR",
+                                    event_type=EventType.STRATEGY_ERROR.value,
                                     data={
                                         "strategy": strat_key,
                                         "symbol": symbol,
@@ -937,6 +1321,10 @@ class TradingEngine:
                     # --- Check for closed positions ---
                     await self._check_closed_positions()
 
+                    # --- Periodic stale PENDING trade cleanup (every ~5 min) ---
+                    if cycle_count % 60 == 0:
+                        await self._cleanup_stale_pending_trades()
+
                     # --- Fetch account info ---
                     account_summary = {"balance": None, "equity": None, "drawdown": None}
                     try:
@@ -950,6 +1338,10 @@ class TradingEngine:
                         }
                     except Exception as e:
                         logger.warning("account_info_fetch_failed", error=str(e))
+
+                    # --- Record equity snapshot every ~5 min (60 cycles) ---
+                    if cycle_count % 60 == 0 and account_summary.get("equity"):
+                        await self._record_equity_snapshot(account_summary)
 
                     # --- Kill switch auto-trigger checks ---
                     try:
@@ -976,35 +1368,28 @@ class TradingEngine:
                         logger.warning("kill_switch_auto_check_failed", error=str(ks_err))
 
                     # --- Log comprehensive JSON summary ---
-                    # Resolve regime string and confidence from the last symbol's regime object
-                    if isinstance(regime, dict):
-                        _regime_str = regime.get("regime", "UNKNOWN")
-                        _regime_conf = regime.get("confidence", 0)
-                    elif regime is not None and hasattr(regime, "regime"):
-                        _regime_str = regime.regime.value if hasattr(regime.regime, "value") else str(regime.regime)
-                        _regime_conf = getattr(regime, "confidence", 0)
-                    else:
-                        _regime_str = "UNKNOWN"
-                        _regime_conf = 0
+                    primary_symbol = self._symbols[0] if self._symbols else "XAUUSD"
+                    primary_symbol_data = symbols_cycle_data.get(primary_symbol, {})
 
                     cycle_summary = {
                         "event": "engine_cycle",
                         "cycle": cycle_count,
                         "symbols": self._symbols,
+                        "symbols_data": symbols_cycle_data,
                         "signals": all_signals_summary,
                         "risk_checks": all_risk_checks,
                         "trades": all_trades,
                         "trades_this_cycle": len(all_trades),
                         "account": account_summary,
                         # Fields required by Brain.process_cycle()
-                        "symbol": self._symbols[0] if self._symbols else "XAUUSD",
-                        "indicators": indicator_values,
-                        "regime": _regime_str,
-                        "confidence": _regime_conf,
-                        "new_candle": True,
-                        "bid": tick_data.get("bid", 0) if isinstance(tick_data, dict) else 0,
-                        "ask": tick_data.get("ask", 0) if isinstance(tick_data, dict) else 0,
-                        "spread": tick_data.get("spread", 0) if isinstance(tick_data, dict) else 0,
+                        "symbol": primary_symbol,
+                        "indicators": primary_symbol_data.get("indicators", {}),
+                        "regime": primary_symbol_data.get("regime", "UNKNOWN"),
+                        "confidence": primary_symbol_data.get("confidence", 0),
+                        "new_candle": primary_symbol_data.get("new_candle", False),
+                        "bid": primary_symbol_data.get("bid", 0),
+                        "ask": primary_symbol_data.get("ask", 0),
+                        "spread": primary_symbol_data.get("spread", 0),
                     }
                     logger.info("engine_cycle", data=json.dumps(cycle_summary, default=str))
 
@@ -1022,7 +1407,7 @@ class TradingEngine:
                         error=str(e)
                     )
                     await self._event_bus.publish(
-                        event_type="SYSTEM_ERROR",
+                        event_type=EventType.SYSTEM_ERROR.value,
                         data={
                             "module": "engine.orchestrator",
                             "error": str(e),
@@ -1065,6 +1450,85 @@ class TradingEngine:
 
         self._cached_master_id = master.id
         return master.id
+
+    async def _record_equity_snapshot(self, account_summary: dict) -> None:
+        """
+        PURPOSE: Record an equity snapshot to the equity_snapshots table.
+
+        Inserts a new row with current equity, balance, and margin.
+        Caps rows per master account at EquitySnapshot.MAX_SNAPSHOTS_PER_ACCOUNT
+        by deleting the oldest rows when the limit is exceeded.
+
+        Args:
+            account_summary: Dict with keys balance, equity, and optionally margin.
+
+        CALLED BY: _main_loop (every ~60 cycles / ~5 minutes)
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                master_id = await self._get_or_create_master_id(session)
+
+                # Also update MasterAccount balance/equity so DB stays in sync
+                stmt = select(MasterAccount).where(MasterAccount.id == master_id)
+                result = await session.execute(stmt)
+                master = result.scalar_one_or_none()
+                if master:
+                    master.balance = account_summary["balance"]
+                    master.equity = account_summary["equity"]
+                    if account_summary["equity"] > master.peak_equity:
+                        master.peak_equity = account_summary["equity"]
+
+                # Fetch margin from MT5 (already cached in AccountInfo)
+                margin_used = 0.0
+                try:
+                    acct_data = await self._account_info._get_account_data()
+                    margin_used = float(acct_data.get("margin", 0.0))
+                except Exception:
+                    pass
+
+                snapshot = EquitySnapshot(
+                    master_id=master_id,
+                    equity=account_summary["equity"],
+                    balance=account_summary["balance"],
+                    margin_used=margin_used,
+                )
+                session.add(snapshot)
+                await session.flush()
+
+                # Cap: keep only the most recent MAX rows per master account
+                max_rows = EquitySnapshot.MAX_SNAPSHOTS_PER_ACCOUNT
+                count_stmt = select(func.count(EquitySnapshot.id)).where(
+                    EquitySnapshot.master_id == master_id
+                )
+                total = (await session.execute(count_stmt)).scalar() or 0
+
+                if total > max_rows:
+                    excess = total - max_rows
+                    # Find IDs of the oldest excess rows
+                    oldest_stmt = (
+                        select(EquitySnapshot.id)
+                        .where(EquitySnapshot.master_id == master_id)
+                        .order_by(EquitySnapshot.timestamp.asc())
+                        .limit(excess)
+                    )
+                    oldest_ids = (await session.execute(oldest_stmt)).scalars().all()
+                    if oldest_ids:
+                        from sqlalchemy import delete
+                        await session.execute(
+                            delete(EquitySnapshot).where(
+                                EquitySnapshot.id.in_(oldest_ids)
+                            )
+                        )
+
+                await session.commit()
+                logger.info(
+                    "equity_snapshot_recorded",
+                    equity=account_summary["equity"],
+                    balance=account_summary["balance"],
+                    margin_used=margin_used,
+                )
+        except Exception as e:
+            logger.warning("equity_snapshot_recording_failed", error=str(e))
 
     async def _recover_open_positions(self) -> None:
         """
@@ -1129,6 +1593,97 @@ class TradingEngine:
                 )
         except Exception as e:
             logger.warning("position_recovery_failed", error=str(e))
+
+    async def _cleanup_stale_pending_trades(self) -> None:
+        """
+        PURPOSE: Find and resolve trades stuck in PENDING status due to an engine
+        crash between the two-phase write (create PENDING -> update to OPEN).
+
+        For each stale PENDING trade:
+        - If it has an mt5_ticket AND the ticket is found in current MT5 positions,
+          promote it to OPEN (the order actually went through).
+        - Otherwise, mark it as FAILED with a crash-recovery note.
+
+        CALLED BY: start() at engine startup, _main_loop() periodically
+        """
+        try:
+            cutoff = datetime.utcnow() - timedelta(seconds=STALE_PENDING_TIMEOUT_SECONDS)
+
+            async with AsyncSessionLocal() as session:
+                stmt = select(TradeModel).where(
+                    and_(
+                        TradeModel.status == "PENDING",
+                        TradeModel.opened_at < cutoff,
+                    )
+                )
+                result = await session.execute(stmt)
+                stale_trades = result.scalars().all()
+
+                if not stale_trades:
+                    return
+
+                logger.warning(
+                    "stale_pending_trades_found",
+                    count=len(stale_trades),
+                    cutoff=cutoff.isoformat(),
+                )
+
+                # Build set of currently open MT5 tickets for cross-reference
+                mt5_open_tickets: set = set()
+                try:
+                    mt5_positions = await self._order_manager.get_open_positions()
+                    mt5_open_tickets = {p.get("ticket") for p in (mt5_positions or [])}
+                except Exception as e:
+                    logger.warning("stale_pending_mt5_fetch_failed", error=str(e))
+
+                recovered = 0
+                failed = 0
+                for trade in stale_trades:
+                    if trade.mt5_ticket and trade.mt5_ticket in mt5_open_tickets:
+                        # The order actually executed on MT5 — promote to OPEN
+                        trade.status = "OPEN"
+                        recovered += 1
+                        logger.info(
+                            "stale_pending_recovered_to_open",
+                            trade_id=str(trade.id),
+                            mt5_ticket=trade.mt5_ticket,
+                        )
+                    else:
+                        # No evidence the order executed — mark as FAILED
+                        trade.status = "FAILED"
+                        trade.reason = (
+                            (trade.reason or "")
+                            + " | Engine crash recovery: stale PENDING trade marked FAILED"
+                        ).lstrip(" | ")
+                        failed += 1
+                        logger.warning(
+                            "stale_pending_marked_failed",
+                            trade_id=str(trade.id),
+                            mt5_ticket=trade.mt5_ticket,
+                        )
+
+                await session.commit()
+
+                if recovered or failed:
+                    logger.info(
+                        "stale_pending_cleanup_complete",
+                        recovered=recovered,
+                        failed=failed,
+                    )
+
+                    await self._event_bus.publish(
+                        event_type="STALE_PENDING_CLEANUP",
+                        data={
+                            "recovered": recovered,
+                            "failed": failed,
+                            "cutoff": cutoff.isoformat(),
+                        },
+                        source="engine.orchestrator",
+                        severity="WARNING",
+                    )
+
+        except Exception as e:
+            logger.error("stale_pending_cleanup_error", error=str(e))
 
     async def _check_closed_positions(self) -> None:
         """
@@ -1324,28 +1879,45 @@ class TradingEngine:
                     except Exception as perf_err:
                         logger.warning("strategy_perf_update_failed", error=str(perf_err))
 
+                    # Classify loss reason for learning
+                    net_profit = profit - commission - swap
+                    failure_reason = None
+                    pure_code = strategy_code.split('_')[-1] if '_' in strategy_code else strategy_code
+                    if net_profit < 0 and trade_obj:
+                        failure_reason = self._classify_loss_reason(
+                            trade_obj, exit_price, trade_info.get('direction', 'BUY')
+                        )
+                        logger.info(
+                            "trade_loss_classified",
+                            strategy=pure_code,
+                            failure_reason=failure_reason,
+                            net_profit=net_profit,
+                        )
+
+                    # Track loss streak for auto-pause
+                    self._record_trade_outcome(pure_code, won=(net_profit > 0))
+
                     # Update risk manager with closed trade P&L
                     try:
-                        net_profit = profit - commission - swap
                         await self._risk_manager.post_trade_update(net_profit, trade_info.get('symbol', ''))
                     except Exception as risk_err:
                         logger.warning("post_trade_risk_update_failed", error=str(risk_err))
 
                     # Notify Brain about the completed trade
                     try:
-                        net_profit = profit - commission - swap
                         brain = get_brain()
-                        # Extract pure strategy code (e.g. "A" from "A" or "EURUSD_A")
-                        pure_code = strategy_code.split('_')[-1] if '_' in strategy_code else strategy_code
                         brain.process_trade_result({
                             "strategy": pure_code,
                             "symbol": trade_info['symbol'],
                             "direction": trade_info['direction'],
                             "entry_price": trade_obj.entry_price,
                             "exit_price": exit_price,
+                            "net_profit": net_profit,
                             "profit": net_profit,
                             "won": net_profit > 0,
                             "ticket": ticket,
+                            "status": "closed",
+                            "failure_reason": failure_reason,
                         })
                     except Exception as brain_err:
                         logger.warning("brain_close_notify_error", error=str(brain_err))
@@ -1354,7 +1926,7 @@ class TradingEngine:
                     try:
                         net_profit = profit - commission - swap
                         await self._event_bus.publish(
-                            "TRADE_CLOSED",
+                            EventType.TRADE_CLOSED.value,
                             data={
                                 "trade_id": str(trade_id),
                                 "strategy_code": strategy_code,

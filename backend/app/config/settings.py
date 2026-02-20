@@ -38,8 +38,10 @@ class Settings(BaseSettings):
     MAX_DRAWDOWN_PCT: float = 15.0
     DAILY_LOSS_LIMIT_PCT: float = 5.0
     RISK_PER_TRADE_PCT: float = 1.0
+    MIN_SIGNAL_CONFIDENCE: float = 0.3
 
     # System Settings
+    APP_ENV: str = "development"
     DEBUG: bool = False
     DRY_RUN: bool = True
     LOG_LEVEL: str = "INFO"
@@ -49,30 +51,85 @@ class Settings(BaseSettings):
     # OpenAI LLM Configuration
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1/chat/completions"
+
+    # Z.AI LLM Configuration
+    ZAI_API_KEY: str = ""
+    ZAI_MODEL: str = "glm-4.6"
+    ZAI_BASE_URL: str = "https://api.z.ai/api/paas/v4/chat/completions"
+
+    # Brain runtime selection (openai | zai)
+    BRAIN_LLM_PROVIDER: str = "openai"
+    # Writable directory for brain persistence files (memory, XP, allocator, RL state)
+    BRAIN_DATA_DIR: str = "/app/data/brain"
 
     # Admin Credentials
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin"
 
-    def validate_production_settings(self) -> None:
-        """
-        PURPOSE: Enforce that sensitive defaults are not used in production.
+    # Default insecure values that must be changed for non-dev environments
+    _INSECURE_DEFAULTS: dict[str, str] = {
+        "JWT_SECRET": "change-me-in-production",
+        "API_KEY": "change-me-in-production",
+        "ADMIN_PASSWORD": "admin",
+    }
 
-        CALLED BY: Application startup when DRY_RUN is False.
+    def is_production(self) -> bool:
+        """
+        PURPOSE: Determine whether the app is running in production mode.
+
+        Returns:
+            bool: True when APP_ENV indicates production.
+        """
+        return self.APP_ENV.strip().lower() in {"prod", "production"}
+
+    def is_development(self) -> bool:
+        """
+        PURPOSE: Determine whether the app is running in development mode.
+
+        Returns:
+            bool: True when APP_ENV indicates development or debug is on.
+        """
+        return self.APP_ENV.strip().lower() in {"dev", "development"} or self.DEBUG
+
+    def get_insecure_defaults(self) -> list[str]:
+        """
+        PURPOSE: Return list of settings that still use insecure default values.
+
+        Returns:
+            list[str]: Setting names that are still at their insecure defaults.
+        """
+        return [
+            name for name, default_val in self._INSECURE_DEFAULTS.items()
+            if getattr(self, name) == default_val
+        ]
+
+    def validate_credentials(self) -> None:
+        """
+        PURPOSE: Enforce that sensitive defaults are not used outside development.
+
+        CALLED BY: Application startup (create_app / on_startup).
+
+        In production/staging: raises ValueError with clear instructions.
+        In development: returns the list of warnings for the caller to log.
 
         Raises:
-            ValueError: If JWT_SECRET or ADMIN_PASSWORD are still set to
-                        insecure default values.
+            ValueError: If credentials are insecure defaults in non-dev mode.
         """
-        if self.DRY_RUN:
+        insecure = self.get_insecure_defaults()
+        if not insecure:
             return
-        errors = []
-        if self.JWT_SECRET == "change-me-in-production":
-            errors.append("JWT_SECRET must be changed from the default value before running in production.")
-        if self.ADMIN_PASSWORD == "admin":
-            errors.append("ADMIN_PASSWORD must be changed from the default value before running in production.")
-        if errors:
-            raise ValueError("Production settings validation failed:\n" + "\n".join(errors))
+
+        hint = (
+            "Set these in your .env file or as environment variables:\n"
+            + "\n".join(f"  {name}=<your-secure-value>" for name in insecure)
+        )
+
+        if not self.is_development():
+            raise ValueError(
+                f"SECURITY: Insecure default credentials detected for: "
+                f"{', '.join(insecure)}.\n{hint}"
+            )
 
     class Config:
         """Pydantic model configuration."""

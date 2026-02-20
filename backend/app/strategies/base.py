@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Optional
 import pandas as pd
 
-from app.config.constants import StrategyCode, StrategyStatus
+from app.config.constants import EventType, StrategyCode, StrategyStatus
 from app.bridge.data_feed import DataFeed
 from app.bridge.order_manager import OrderManager
 from app.events.bus import EventBus
@@ -39,7 +39,7 @@ class BaseStrategy(ABC):
     CALLED BY: engine/orchestrator.py → for signal generation and lifecycle
 
     Attributes:
-        _code: Strategy code enumeration (A, B, C, D)
+        _code: Strategy code enumeration (A, B, C, D, E)
         _name: Human-readable strategy name
         _data_feed: DataFeed instance for accessing market data
         _order_manager: OrderManager instance for executing trades
@@ -65,7 +65,7 @@ class BaseStrategy(ABC):
         PURPOSE: Initialize BaseStrategy with dependencies and configuration.
 
         Args:
-            code: StrategyCode enum value (A, B, C, D)
+            code: StrategyCode enum value (A, B, C, D, E)
             name: Human-readable strategy name
             data_feed: DataFeed instance for market data access
             order_manager: OrderManager instance for trade execution
@@ -99,7 +99,7 @@ class BaseStrategy(ABC):
         PURPOSE: Get the strategy code enumeration.
 
         Returns:
-            StrategyCode: Strategy identifier (A, B, C, D)
+            StrategyCode: Strategy identifier (A, B, C, D, E)
 
         CALLED BY: engine/orchestrator.py, external modules
         """
@@ -155,7 +155,7 @@ class BaseStrategy(ABC):
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._event_bus.publish(
-                event_type="STRATEGY_STARTED",
+                event_type=EventType.STRATEGY_STARTED.value,
                 data={
                     "strategy_code": self._code.value,
                     "strategy_name": self._name,
@@ -214,7 +214,7 @@ class BaseStrategy(ABC):
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._event_bus.publish(
-                event_type="STRATEGY_PAUSED",
+                event_type=EventType.STRATEGY_PAUSED.value,
                 data={
                     "strategy_code": self._code.value,
                     "strategy_name": self._name,
@@ -323,6 +323,32 @@ class BaseStrategy(ABC):
         """
         pass
 
+    def update_parameters(self, updates: dict) -> dict:
+        """
+        PURPOSE: Apply dynamic parameter updates. Override in subclasses to
+        sync private attributes.
+
+        Args:
+            updates: Dict of parameter name -> new value
+
+        Returns:
+            dict: Actually applied changes {param: new_value}
+
+        CALLED BY: engine.py (LLM parameter recommendations)
+        """
+        applied = {}
+        for param, new_val in updates.items():
+            if param in self._config:
+                self._config[param] = new_val
+                applied[param] = new_val
+                logger.info(
+                    "strategy_param_updated",
+                    strategy_code=self._code.value,
+                    param=param,
+                    new_value=new_val,
+                )
+        return applied
+
     @abstractmethod
     def get_config(self) -> dict:
         """
@@ -399,7 +425,8 @@ class BaseStrategy(ABC):
                 stop_loss=signal.sl_price,
                 take_profit=signal.tp_price,
                 strategy_code=self._code.value,
-                reason=signal.reason
+                reason=signal.reason,
+                confidence=signal.confidence,
             )
 
             logger.info(
