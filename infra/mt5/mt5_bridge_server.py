@@ -185,19 +185,27 @@ def close(ticket):
     close_type = mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY
     tick_data = mt5.symbol_info_tick(p.symbol)
     price = tick_data.bid if p.type == 0 else tick_data.ask
-    for filling in [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]:
+    # Get symbol's supported filling mode
+    si = mt5.symbol_info(p.symbol)
+    fill_modes = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
+    if si and si.filling_mode == 2:
+        # Symbol only supports IOC — try IOC first
+        fill_modes = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+    last_result = None
+    for filling in fill_modes:
         req = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": p.symbol,
             "volume": p.volume, "type": close_type, "position": ticket,
-            "price": price, "deviation": 20, "magic": 777777,
+            "price": price, "deviation": 50, "magic": 777777,
             "comment": "JSR_close", "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling,
         }
         result = mt5.order_send(req)
-        log.info(f"CLOSE ticket={ticket} {p.symbol} {p.volume} @ {price} | retcode={result.retcode}")
+        last_result = result
+        log.info(f"CLOSE ticket={ticket} {p.symbol} {p.volume} @ {price} | filling={filling} | retcode={result.retcode} | {result.comment}")
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             return jsonify({"success": True, "retcode": result.retcode, "profit": p.profit})
-    return jsonify({"success": False, "retcode": result.retcode, "comment": result.comment}), 400
+    return jsonify({"success": False, "retcode": last_result.retcode if last_result else -1, "comment": last_result.comment if last_result else "order_send failed"}), 400
 
 
 @app.route('/close_all', methods=['POST'])
@@ -212,11 +220,15 @@ def close_all():
         close_type = mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY
         tick_data = mt5.symbol_info_tick(p.symbol)
         price = tick_data.bid if p.type == 0 else tick_data.ask
-        for filling in [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]:
+        si = mt5.symbol_info(p.symbol)
+        fill_modes = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
+        if si and si.filling_mode == 2:
+            fill_modes = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+        for filling in fill_modes:
             req = {
                 "action": mt5.TRADE_ACTION_DEAL, "symbol": p.symbol,
                 "volume": p.volume, "type": close_type, "position": p.ticket,
-                "price": price, "deviation": 20, "magic": 777777,
+                "price": price, "deviation": 50, "magic": 777777,
                 "comment": "JSR_killswitch", "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": filling,
             }
