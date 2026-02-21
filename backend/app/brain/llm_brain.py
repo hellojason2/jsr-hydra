@@ -679,21 +679,34 @@ Focus on:
         """Extract a JSON object from an LLM response, handling markdown fences."""
         if not text or self._is_error_content(text):
             return None
-        # Strip markdown code fences if present
-        cleaned = re.sub(r"```(?:json)?\s*", "", text).strip()
-        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+        # Try to extract content between markdown code fences first
+        fence_match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?\s*```", text)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+        # Try direct parse
         try:
-            return json.loads(cleaned)
+            return json.loads(text.strip())
         except json.JSONDecodeError:
-            # Try to find JSON object in the text
-            match = re.search(r"\{[\s\S]*\}", cleaned)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
-            logger.warning("json_parse_failed", text_preview=text[:120])
-            return None
+            pass
+        # Try to find the outermost JSON object via brace matching
+        start = text.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+        logger.warning("json_parse_failed", text_preview=text[:120])
+        return None
 
     # ------------------------------------------------------------------ #
     #  Bull vs Bear Debate (TradingAgents pattern)
