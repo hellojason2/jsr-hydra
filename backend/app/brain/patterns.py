@@ -350,6 +350,126 @@ def detect_indicator_patterns(trade_history: list) -> list[str]:
     return insights
 
 
+def detect_hour_patterns(hour_stats: dict, current_hour: int) -> list[str]:
+    """
+    PURPOSE: Detect strategy performance patterns for a specific UTC hour.
+
+    Analyses hour_stats to find strategies that perform notably well or
+    poorly during the given hour across all tracked symbols.
+
+    Args:
+        hour_stats: Nested dict in the form
+            {strategy: {symbol: {hour_str: {wins, losses, total, profit}}}}.
+        current_hour: UTC hour (0-23) to analyse.
+
+    Returns:
+        list[str]: Human-readable insight strings such as
+            "Strategy_A strong at hour 14 (win_rate=0.75, trades=40)".
+
+    CALLED BY: brain/learner.py — get_learned_insights()
+    """
+    if not hour_stats:
+        return []
+
+    hour_key = str(current_hour)
+    insights = []
+
+    for strategy in sorted(hour_stats.keys()):
+        # Aggregate wins/total across all symbols for this strategy + hour
+        agg_wins = 0
+        agg_total = 0
+        agg_profit = 0.0
+
+        for sym_data in hour_stats[strategy].values():
+            bucket = sym_data.get(hour_key, {})
+            agg_wins += bucket.get("wins", 0)
+            agg_total += bucket.get("total", 0)
+            agg_profit += bucket.get("profit", 0.0)
+
+        if agg_total < MIN_TRADES_FOR_PATTERN:
+            continue
+
+        win_rate = _safe_win_rate(agg_wins, agg_total)
+        avg_profit = agg_profit / agg_total
+        strat_name = STRATEGY_NAMES.get(strategy, f"Strategy {strategy}")
+
+        if win_rate >= 0.65:
+            insights.append(
+                f"Strategy {strategy} strong at hour {current_hour:02d}:00 UTC "
+                f"(win_rate={_pct(win_rate)}, trades={agg_total}, "
+                f"avg profit ${avg_profit:+.2f})"
+            )
+        elif win_rate <= 0.35:
+            insights.append(
+                f"Strategy {strategy} weak at hour {current_hour:02d}:00 UTC "
+                f"(win_rate={_pct(win_rate)}, trades={agg_total}, "
+                f"avg profit ${avg_profit:+.2f})"
+            )
+
+    return insights
+
+
+def detect_dow_patterns(dow_stats: dict, current_dow: int) -> list[str]:
+    """
+    PURPOSE: Detect strategy performance patterns for a specific day of week.
+
+    Analyses dow_stats to find strategies that perform notably well or
+    poorly on the given weekday across all tracked symbols.
+
+    Args:
+        dow_stats: Nested dict in the form
+            {strategy: {symbol: {dow_str: {wins, losses, total, profit}}}}.
+        current_dow: UTC weekday (0=Monday … 6=Sunday) to analyse.
+
+    Returns:
+        list[str]: Human-readable insight strings such as
+            "Strategy_B weak on Monday (win_rate=0.25, trades=16)".
+
+    CALLED BY: brain/learner.py — get_learned_insights()
+    """
+    if not dow_stats:
+        return []
+
+    _DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    dow_key = str(current_dow)
+    day_name = _DOW_NAMES[current_dow]
+    insights = []
+
+    for strategy in sorted(dow_stats.keys()):
+        # Aggregate wins/total across all symbols for this strategy + day-of-week
+        agg_wins = 0
+        agg_total = 0
+        agg_profit = 0.0
+
+        for sym_data in dow_stats[strategy].values():
+            bucket = sym_data.get(dow_key, {})
+            agg_wins += bucket.get("wins", 0)
+            agg_total += bucket.get("total", 0)
+            agg_profit += bucket.get("profit", 0.0)
+
+        if agg_total < MIN_TRADES_FOR_PATTERN:
+            continue
+
+        win_rate = _safe_win_rate(agg_wins, agg_total)
+        avg_profit = agg_profit / agg_total
+        strat_name = STRATEGY_NAMES.get(strategy, f"Strategy {strategy}")
+
+        if win_rate >= 0.65:
+            insights.append(
+                f"Strategy {strategy} strong on {day_name} "
+                f"(win_rate={_pct(win_rate)}, trades={agg_total}, "
+                f"avg profit ${avg_profit:+.2f})"
+            )
+        elif win_rate <= 0.35:
+            insights.append(
+                f"Strategy {strategy} weak on {day_name} "
+                f"(win_rate={_pct(win_rate)}, trades={agg_total}, "
+                f"avg profit ${avg_profit:+.2f})"
+            )
+
+    return insights
+
+
 def detect_streaks(trade_history: list) -> dict:
     """
     PURPOSE: Detect current winning/losing streaks per strategy.
@@ -533,3 +653,48 @@ def generate_market_memory(trade_history: list, current_regime: str) -> str:
             )
 
     return ". ".join(parts) + "."
+
+
+def detect_transition_patterns(transition_stats: dict, current_transition: Optional[str]) -> list[str]:
+    """
+    PURPOSE: Generate pattern strings for the current regime transition context.
+
+    Analyses the accumulated transition_stats dict to surface which strategies
+    have a meaningful track record (5+ trades) immediately after each type of
+    regime shift.  Highlights both strong performers and poor performers so the
+    learner can surface them as actionable insights.
+
+    Args:
+        transition_stats: Dict keyed by "FROM->TO" strings, each mapping
+                          strategy codes to {wins, losses, total, profit} buckets.
+        current_transition: The active transition key (e.g. "RANGING->TRENDING_UP")
+                            or None if no recent regime change.
+
+    Returns:
+        list[str]: Human-readable pattern strings.  Only generated for buckets
+                   with MIN_TRADES_FOR_PATTERN (5) or more trades.
+
+    CALLED BY: brain/learner.py — get_learned_insights()
+    """
+    if not transition_stats:
+        return []
+
+    insights = []
+
+    for transition_key, strategies in transition_stats.items():
+        is_current = (transition_key == current_transition)
+        prefix = f"[Active transition] " if is_current else ""
+
+        for strategy_code, data in strategies.items():
+            total = data.get("total", 0)
+            if total < MIN_TRADES_FOR_PATTERN:
+                continue
+
+            wins = data.get("wins", 0)
+            win_rate = _safe_win_rate(wins, total)
+
+            insights.append(
+                f"{prefix}After {transition_key}: "                f"Strategy_{strategy_code} has {_pct(win_rate)} win rate "                f"({total} trades)"
+            )
+
+    return insights

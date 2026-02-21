@@ -624,6 +624,9 @@ class Brain:
             )
             if change["symbol"] == primary_symbol:
                 llm_regime_change = change
+                # Notify learner of the regime transition so it can track
+                # strategy performance in the 60-minute post-transition window.
+                self._learner.notify_regime_change(change["old"], change["new"])
         return llm_regime_change
 
     def _build_market_data_for_llm(

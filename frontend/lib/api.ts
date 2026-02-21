@@ -226,4 +226,64 @@ export async function updateLLMConfig(provider: string, model?: string, apiKey?:
   })
 }
 
+// Runtime Settings
+export interface RuntimeSettings {
+  learning: {
+    exploration_rate: number
+    min_trades_for_adjustment: number
+    max_trade_history: number
+    streak_warning_threshold: number
+    confidence_lookback: number
+    learning_speed: string
+    automation_level: string
+  }
+  allocator: {
+    rebalance_interval: number
+    max_change_per_rebalance: number
+    min_allocation_pct: number
+    max_allocation_pct: number
+  }
+  risk: {
+    max_drawdown_pct: number
+    daily_loss_limit_pct: number
+    per_trade_risk_pct: number
+    max_lots: number
+  }
+  patterns: {
+    hour_filter_enabled: boolean
+    dow_filter_enabled: boolean
+    min_trades_for_pattern: number
+  }
+  exploration_decay: {
+    exploration_decay_enabled: boolean
+    exploration_decay_after_trades: number
+    exploration_decay_target: number
+  }
+}
+
+export async function getRuntimeSettings(): Promise<RuntimeSettings> {
+  return fetchApi<RuntimeSettings>("/api/settings/runtime")
+}
+
+export async function updateRuntimeSettings(settings: Partial<any>): Promise<RuntimeSettings> {
+  return fetchApi<RuntimeSettings>("/api/settings/runtime", {
+    method: "PATCH",
+    body: JSON.stringify(settings),
+  })
+}
+
+export async function resetRuntimeSettings(): Promise<RuntimeSettings> {
+  return fetchApi<RuntimeSettings>("/api/settings/runtime/reset", {
+    method: "POST",
+  })
+}
+
+export async function getHourPerformance(): Promise<any> {
+  return fetchApi<any>("/api/brain/hour-performance")
+}
+
+export async function getDowPerformance(): Promise<any> {
+  return fetchApi<any>("/api/brain/dow-performance")
+}
+
 export { BASE_URL };

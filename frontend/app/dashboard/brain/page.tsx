@@ -2,12 +2,15 @@
 
 import React, { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { Brain, RefreshCw } from 'lucide-react'
+import { Brain, RefreshCw, BookOpen } from 'lucide-react'
 import { ThoughtStream } from '@/components/brain/ThoughtStream'
 import { MarketAnalysis } from '@/components/brain/MarketAnalysis'
 import { StrategyScores } from '@/components/brain/StrategyScores'
 import { NextMoves } from '@/components/brain/NextMoves'
 import { LLMInsights } from '@/components/brain/LLMInsights'
+import { PatternHeatmap } from '@/components/brain/PatternHeatmap'
+import { LearningTips } from '@/components/brain/LearningTips'
+import { StrategyScorecard } from '@/components/brain/StrategyScorecard'
 import { useAppStore } from '@/store/useAppStore'
 
 interface BrainState {
@@ -74,6 +77,13 @@ export default function BrainPage() {
   const [lastFetch, setLastFetch] = useState<Date | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [isAuthRedirecting, setIsAuthRedirecting] = useState(false)
+
+  // Learning patterns state
+  const [hourPerf, setHourPerf] = useState<any>(null)
+  const [dowPerf, setDowPerf] = useState<any>(null)
+  const [strategyXP, setStrategyXP] = useState<Record<string, any>>({})
+  const [rlStats, setRlStats] = useState<any>(null)
+  const [showLearning, setShowLearning] = useState(false)
 
   const buildAuthHeaders = useCallback((token: string | null, withJson = false) => {
     const headers: Record<string, string> = token
@@ -169,6 +179,31 @@ export default function BrainPage() {
         }
       } catch {
         // LLM insights are optional -- don't block on failure
+      }
+
+      // Fetch learning pattern data (non-blocking)
+      try {
+        const [hourRes, dowRes, xpRes, rlRes] = await Promise.allSettled([
+          fetch('/api/brain/hour-performance', { headers }),
+          fetch('/api/brain/dow-performance', { headers }),
+          fetch('/api/brain/strategy-xp', { headers }),
+          fetch('/api/brain/rl-stats', { headers }),
+        ])
+
+        if (hourRes.status === 'fulfilled' && hourRes.value.ok) {
+          setHourPerf(await hourRes.value.json())
+        }
+        if (dowRes.status === 'fulfilled' && dowRes.value.ok) {
+          setDowPerf(await dowRes.value.json())
+        }
+        if (xpRes.status === 'fulfilled' && xpRes.value.ok) {
+          setStrategyXP(await xpRes.value.json())
+        }
+        if (rlRes.status === 'fulfilled' && rlRes.value.ok) {
+          setRlStats(await rlRes.value.json())
+        }
+      } catch {
+        // Learning pattern data is optional
       }
     } catch (err) {
       console.error('Error fetching brain state:', err)
@@ -406,6 +441,142 @@ export default function BrainPage() {
               />
             </div>
           </div>
+        </div>
+
+        {/* ─── Learning Patterns Section ─── */}
+        <div className="mb-6">
+          {/* Section toggle header */}
+          <button
+            onClick={() => setShowLearning((v) => !v)}
+            className="w-full flex items-center justify-between px-5 py-3 bg-brand-panel border border-[#00d97e]/20 rounded-lg hover:border-[#00d97e]/40 transition-all duration-200 group"
+            style={{ boxShadow: '0 0 12px rgba(0,217,126,0.04)' }}
+          >
+            <div className="flex items-center gap-3">
+              <div className="p-1.5 rounded-md bg-[#00d97e]/10 border border-[#00d97e]/20">
+                <BookOpen size={16} className="text-[#00d97e]" />
+              </div>
+              <div className="text-left">
+                <h3 className="text-sm font-semibold text-gray-100">Learning Patterns</h3>
+                <p className="text-xs text-gray-500">
+                  Strategy heatmaps, scorecards & brain insights
+                </p>
+              </div>
+            </div>
+            <span className="text-gray-500 group-hover:text-gray-300 transition-colors text-xs font-mono">
+              {showLearning ? '▲ hide' : '▼ show'}
+            </span>
+          </button>
+
+          {showLearning && (
+            <div className="mt-4 space-y-6">
+              {/* Learning Tips */}
+              {llmInsights.length > 0 && (
+                <LearningTips
+                  insights={llmInsights
+                    .filter((i: any) => !i.is_error && i.content)
+                    .map((i: any) => i.content as string)
+                    .slice(0, 20)}
+                />
+              )}
+              {llmInsights.length === 0 && <LearningTips insights={[]} />}
+
+              {/* Heatmaps */}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                {/* Hour performance heatmap */}
+                <div className="bg-brand-panel border border-gray-700 rounded-lg p-5">
+                  <PatternHeatmap
+                    title="Strategy x Hour of Day"
+                    data={hourPerf?.data ?? {}}
+                    rowLabels={hourPerf?.row_labels ?? []}
+                    colLabels={hourPerf?.col_labels ?? []}
+                  />
+                  {!hourPerf && (
+                    <p className="text-xs text-gray-600 mt-2">
+                      Waiting for hour performance data…
+                    </p>
+                  )}
+                </div>
+
+                {/* Day-of-week performance heatmap */}
+                <div className="bg-brand-panel border border-gray-700 rounded-lg p-5">
+                  <PatternHeatmap
+                    title="Strategy x Day of Week"
+                    data={dowPerf?.data ?? {}}
+                    rowLabels={dowPerf?.row_labels ?? []}
+                    colLabels={dowPerf?.col_labels ?? []}
+                  />
+                  {!dowPerf && (
+                    <p className="text-xs text-gray-600 mt-2">
+                      Waiting for day-of-week performance data…
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* Strategy Scorecards */}
+              {Object.keys(strategyXP).length > 0 && (
+                <div>
+                  <h4 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">
+                    Strategy Scorecards
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {(() => {
+                      const entries = Object.entries(strategyXP) as [string, any][]
+                      // Find top strategy by win_rate
+                      const topCode = entries.reduce(
+                        (best, [code, xp]) =>
+                          (xp.win_rate ?? 0) > (strategyXP[best]?.win_rate ?? 0)
+                            ? code
+                            : best,
+                        entries[0]?.[0] ?? '',
+                      )
+                      return entries.map(([code, xp]) => (
+                        <StrategyScorecard
+                          key={code}
+                          strategyCode={code}
+                          strategyName={xp.name ?? `Strategy ${code}`}
+                          xpData={{
+                            level: xp.level ?? 1,
+                            xp: xp.total_xp ?? 0,
+                            xp_to_next: xp.xp_to_next_level ?? 100,
+                            win_rate: xp.win_rate ?? 0,
+                            total_trades: xp.total_trades ?? 0,
+                            total_profit: 0,
+                            current_streak: xp.current_streak ?? 0,
+                            current_streak_type: xp.current_streak_type ?? 'win',
+                          }}
+                          allocation={
+                            rlStats?.allocations?.[code] ??
+                            rlStats?.strategy_allocations?.[code] ??
+                            0
+                          }
+                          fitnessScore={
+                            rlStats?.fitness_scores?.[code] ??
+                            rlStats?.strategy_scores?.[code]?.fitness ??
+                            0
+                          }
+                          rlExpectedValue={
+                            rlStats?.expected_values?.[code] ??
+                            rlStats?.strategy_scores?.[code]?.ev ??
+                            0
+                          }
+                          isTop={code === topCode}
+                        />
+                      ))
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              {Object.keys(strategyXP).length === 0 && (
+                <div className="bg-brand-panel border border-gray-800 rounded-lg p-6 text-center">
+                  <p className="text-sm text-gray-500">
+                    No strategy XP data yet — scorecards will appear once strategies start trading.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Bottom Section: Brain Activity Indicator */}

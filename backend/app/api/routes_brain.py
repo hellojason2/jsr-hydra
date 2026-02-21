@@ -404,6 +404,71 @@ async def get_auto_allocation_status(
         _raise_brain_route_error("retrieve auto-allocation status", e)
 
 
+# ════════════════════════════════════════════════════════════════
+# Hour and Day-of-Week Performance
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/hour-performance")
+@limiter.limit(READ_LIMIT)
+async def get_hour_performance(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Return strategy performance breakdown by UTC hour of day.
+
+    Returns a nested dict keyed by strategy -> symbol -> hour (0-23 as string),
+    with win rate, trade count, and profit metrics for each bucket.
+
+    Returns:
+        dict: {
+            strategy: {
+                symbol: {
+                    hour_str: {wins, losses, total, profit, win_rate, avg_profit}
+                }
+            }
+        }
+
+    CALLED BY: Frontend hour-of-day performance panel
+    """
+    try:
+        brain = get_brain()
+        return brain._learner.get_hour_performance()
+    except Exception as e:
+        _raise_brain_route_error("retrieve hour performance", e)
+
+
+@router.get("/dow-performance")
+@limiter.limit(READ_LIMIT)
+async def get_dow_performance(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Return strategy performance breakdown by day of week (UTC).
+
+    Returns a nested dict keyed by strategy -> symbol -> weekday (0=Monday … 6=Sunday
+    as string), with win rate, trade count, and profit metrics for each bucket.
+
+    Returns:
+        dict: {
+            strategy: {
+                symbol: {
+                    dow_str: {wins, losses, total, profit, win_rate, avg_profit}
+                }
+            }
+        }
+
+    CALLED BY: Frontend day-of-week performance panel
+    """
+    try:
+        brain = get_brain()
+        return brain._learner.get_dow_performance()
+    except Exception as e:
+        _raise_brain_route_error("retrieve day-of-week performance", e)
+
+
 class AutoAllocationToggle(BaseModel):
     enabled: bool
 
@@ -432,3 +497,42 @@ async def toggle_auto_allocation(
         return brain.get_auto_allocation_status()
     except Exception as e:
         _raise_brain_route_error("update auto-allocation status", e)
+
+
+# ════════════════════════════════════════════════════════════════
+# Regime Transition Performance
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/transition-performance")
+@limiter.limit(READ_LIMIT)
+async def get_transition_performance(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Return strategy performance stats segmented by regime transition type.
+
+    Shows how each strategy performs in the 60 minutes immediately following a
+    regime change (e.g. RANGING->TRENDING_UP). Only transitions with 5+ trades
+    per strategy are surfaced as statistically meaningful.
+
+    Returns:
+        dict: {
+            transition_stats: {
+                "FROM->TO": {
+                    "A": {wins, losses, total, profit, win_rate, avg_profit}
+                }
+            },
+            last_regime_change_time: str | null,
+            last_regime_transition: [from, to] | null,
+            within_transition_window: bool,
+        }
+
+    CALLED BY: Frontend regime transition panel
+    """
+    try:
+        brain = get_brain()
+        return brain._learner.get_transition_performance()
+    except Exception as e:
+        _raise_brain_route_error("retrieve transition performance", e)

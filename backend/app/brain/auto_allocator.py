@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.brain.paths import resolve_brain_state_path
+from app.config.runtime_settings import runtime_settings
 from app.utils.logger import get_logger
 
 logger = get_logger("brain.auto_allocator")
@@ -26,16 +27,12 @@ logger = get_logger("brain.auto_allocator")
 # Persistence path for auto-allocation state
 AUTO_ALLOC_STATE_PATH = resolve_brain_state_path("auto_allocation.json")
 
-# How often to rebalance (every N trades across all strategies)
+# Default constants — kept for documentation and as static fallback values.
+# Actual runtime values are read from runtime_settings (Redis-backed) at call-time
+# so they can be tuned via the settings API without restarting the process.
 REBALANCE_INTERVAL = 10
-
-# Maximum allocation change per rebalance (percentage points)
 MAX_CHANGE_PER_REBALANCE = 5.0
-
-# Minimum allocation floor so no strategy is starved
 MIN_ALLOCATION_PCT = 5.0
-
-# Maximum allocation cap per strategy
 MAX_ALLOCATION_PCT = 50.0
 
 # Fitness score weights
@@ -192,9 +189,11 @@ class AutoAllocator:
             for code, score in raw.items()
         }
 
-        # Apply floor and cap
+        # Apply floor and cap (read from runtime settings at call-time)
+        _min_pct = runtime_settings.get("min_allocation_pct")
+        _max_pct = runtime_settings.get("max_allocation_pct")
         for code in target:
-            target[code] = max(MIN_ALLOCATION_PCT, min(MAX_ALLOCATION_PCT, target[code]))
+            target[code] = max(_min_pct, min(_max_pct, target[code]))
 
         # Renormalize after floor/cap to sum to 100%
         clamped_total = sum(target.values())
@@ -229,21 +228,24 @@ class AutoAllocator:
         Returns:
             dict: Smoothed allocation_pct per strategy
         """
+        # Read runtime settings once per call so all codes use the same values
+        _max_change = runtime_settings.get("max_change_per_rebalance")
+        _min_pct = runtime_settings.get("min_allocation_pct")
         smoothed = {}
         for code in STRATEGY_CODES:
             current = current_allocations.get(code, 25.0)
             target = target_allocations.get(code, 25.0)
             diff = target - current
 
-            if abs(diff) <= MAX_CHANGE_PER_REBALANCE:
+            if abs(diff) <= _max_change:
                 smoothed[code] = target
             elif diff > 0:
-                smoothed[code] = round(current + MAX_CHANGE_PER_REBALANCE, 1)
+                smoothed[code] = round(current + _max_change, 1)
             else:
-                smoothed[code] = round(current - MAX_CHANGE_PER_REBALANCE, 1)
+                smoothed[code] = round(current - _max_change, 1)
 
             # Ensure floor
-            smoothed[code] = max(MIN_ALLOCATION_PCT, smoothed[code])
+            smoothed[code] = max(_min_pct, smoothed[code])
 
         # Normalize to 100% after smoothing
         total = sum(smoothed.values())
@@ -295,7 +297,8 @@ class AutoAllocator:
 
         self._trades_since_rebalance += 1
 
-        if self._trades_since_rebalance < REBALANCE_INTERVAL:
+        _rebalance_interval = runtime_settings.get("rebalance_interval")
+        if self._trades_since_rebalance < _rebalance_interval:
             return None
 
         # Time to rebalance
@@ -371,21 +374,25 @@ class AutoAllocator:
 
         CALLED BY: api/routes_brain.py /auto-allocation-status
         """
+        _rebalance_interval = runtime_settings.get("rebalance_interval")
+        _max_change = runtime_settings.get("max_change_per_rebalance")
+        _min_pct = runtime_settings.get("min_allocation_pct")
+        _max_pct = runtime_settings.get("max_allocation_pct")
         return {
             "enabled": self._enabled,
             "trades_since_rebalance": self._trades_since_rebalance,
-            "rebalance_interval": REBALANCE_INTERVAL,
-            "trades_until_next": max(0, REBALANCE_INTERVAL - self._trades_since_rebalance),
+            "rebalance_interval": _rebalance_interval,
+            "trades_until_next": max(0, _rebalance_interval - self._trades_since_rebalance),
             "total_rebalances": self._total_rebalances,
             "last_rebalance_time": self._last_rebalance_time,
             "last_fitness_scores": self._last_fitness_scores,
             "last_allocations": self._last_allocations,
             "rebalance_history": self._rebalance_history[-10:],
             "config": {
-                "rebalance_interval": REBALANCE_INTERVAL,
-                "max_change_per_rebalance": MAX_CHANGE_PER_REBALANCE,
-                "min_allocation_pct": MIN_ALLOCATION_PCT,
-                "max_allocation_pct": MAX_ALLOCATION_PCT,
+                "rebalance_interval": _rebalance_interval,
+                "max_change_per_rebalance": _max_change,
+                "min_allocation_pct": _min_pct,
+                "max_allocation_pct": _max_pct,
                 "weights": {
                     "xp_level": WEIGHT_XP_LEVEL,
                     "win_rate": WEIGHT_WIN_RATE,

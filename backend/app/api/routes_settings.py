@@ -2,8 +2,9 @@
 PURPOSE: Settings API routes for JSR Hydra trading system.
 
 Provides endpoints to read and update runtime trading settings such as
-active trading symbols. Settings are persisted in Redis so both API and
-engine processes share the same configuration.
+active trading symbols and brain/learning runtime parameters. Settings are
+persisted in Redis so both API and engine processes share the same
+configuration.
 
 Authentication required for all endpoints.
 
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 
 from app.api.auth import get_current_user
 from app.config.constants import SUPPORTED_SYMBOLS
+from app.config.runtime_settings import runtime_settings
 from app.config.settings import settings
 from app.core.rate_limit import limiter, READ_LIMIT, WRITE_LIMIT
 from app.engine.engine import SYMBOL_CONFIGS, TRADING_SYMBOLS
@@ -122,3 +124,123 @@ async def update_trading_symbols(
     except Exception as e:
         logger.error("settings_route_failed", action="update trading symbols", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to update trading symbols")
+
+
+# ════════════════════════════════════════════════════════════════
+# Runtime Settings
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/runtime")
+@limiter.limit(READ_LIMIT)
+async def get_runtime_settings(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Return all runtime settings grouped by category.
+
+    Settings are loaded from Redis; falls back to defaults if Redis has no
+    stored values yet.
+
+    Returns:
+        dict: Settings grouped by category (learning, allocator, risk, patterns,
+              exploration_decay).
+
+    CALLED BY: Frontend settings panel
+    """
+    try:
+        return runtime_settings.get_all()
+    except Exception as e:
+        logger.error("settings_route_failed", action="get runtime settings", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve runtime settings")
+
+
+@router.patch("/runtime")
+@limiter.limit(WRITE_LIMIT)
+async def update_runtime_settings(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Update one or more runtime settings.
+
+    Accepts a partial JSON body — only the keys present in the body are
+    updated. All values are validated for type and range before being saved.
+
+    Returns:
+        dict: Updated grouped settings.
+
+    CALLED BY: Frontend settings panel
+
+    Raises:
+        400: If any key is unknown or any value fails validation.
+        500: If Redis write fails.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    try:
+        runtime_settings.update(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logger.error("settings_route_failed", action="update runtime settings", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to persist runtime settings")
+
+    try:
+        return runtime_settings.get_all()
+    except Exception as e:
+        logger.error("settings_route_failed", action="get runtime settings after update", error=str(e))
+        raise HTTPException(status_code=500, detail="Settings saved but failed to retrieve updated values")
+
+
+@router.post("/runtime/reset")
+@limiter.limit(WRITE_LIMIT)
+async def reset_runtime_settings(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Reset all runtime settings to their factory defaults.
+
+    Returns:
+        dict: Grouped settings after reset (all at default values).
+
+    CALLED BY: Frontend settings panel — "Reset to defaults" button
+    """
+    try:
+        result = runtime_settings.reset_to_defaults()
+        return result
+    except Exception as e:
+        logger.error("settings_route_failed", action="reset runtime settings", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to reset runtime settings")
+
+
+@router.get("/runtime/schema")
+@limiter.limit(READ_LIMIT)
+async def get_runtime_settings_schema(
+    request: Request,
+    _current_user: str = Depends(get_current_user),
+):
+    """
+    PURPOSE: Return the full settings schema for frontend form generation.
+
+    Includes label, type, default, min/max or choices, and description for
+    every setting, grouped by category with the ordered category list.
+
+    Returns:
+        dict: {categories: [...], settings: {category: [{key, label, ...}, ...]}}
+
+    CALLED BY: Frontend settings panel — builds the settings form dynamically
+    """
+    try:
+        return runtime_settings.get_schema()
+    except Exception as e:
+        logger.error("settings_route_failed", action="get runtime settings schema", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve settings schema")
