@@ -518,7 +518,7 @@ class TradingEngine:
         """Fetch tick from MT5 or synthetic feed."""
         if self._using_synthetic and self._synthetic_feed:
             return self._synthetic_feed.generate_tick(symbol)
-        return await self._get_tick(symbol)
+        return await self._data_feed.get_tick(symbol)
 
     def _init_risk_management(self) -> None:
         """
