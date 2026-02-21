@@ -1,7 +1,9 @@
 FROM gmag11/metatrader5_vnc:latest
 
 # Install xdotool for GUI automation (enable AutoTrading via Ctrl+E)
-RUN apt-get update -qq && \
+# Note: Wine HQ repo has expired GPG key, so we skip it during update
+RUN rm -f /etc/apt/sources.list.d/winehq.list 2>/dev/null; \
+    apt-get update -qq || true && \
     apt-get install -y -qq --no-install-recommends xdotool && \
     rm -rf /var/lib/apt/lists/*
 
