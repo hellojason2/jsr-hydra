@@ -13,11 +13,19 @@ POLL_INTERVAL=5
 echo "[JSR-AutoTrade] Waiting for MT5 window to appear..."
 
 elapsed=0
+MT5_WID=""
 while [ $elapsed -lt $MAX_WAIT ]; do
-    # Look for the main MT5 window (contains broker name or account number)
-    MT5_WID=$(xdotool search --name "Monaxa\|MetaTrader\|Demo Account\|Real Account" 2>/dev/null | head -1)
+    # Look for the main MT5 window — try multiple patterns
+    # MT5 window titles contain "Demo Account" or "Real Account" or "MetaTrader"
+    MT5_WID=$(xdotool search --name "Demo Account" 2>/dev/null | head -1)
+    [ -z "$MT5_WID" ] && MT5_WID=$(xdotool search --name "Real Account" 2>/dev/null | head -1)
+    [ -z "$MT5_WID" ] && MT5_WID=$(xdotool search --name "MetaTrader" 2>/dev/null | head -1)
+    [ -z "$MT5_WID" ] && MT5_WID=$(xdotool search --name "Monaxa" 2>/dev/null | head -1)
+    [ -z "$MT5_WID" ] && MT5_WID=$(xdotool search --name "Hedge" 2>/dev/null | head -1)
+
     if [ -n "$MT5_WID" ]; then
-        echo "[JSR-AutoTrade] MT5 window found (ID: $MT5_WID) after ${elapsed}s"
+        WNAME=$(xdotool getwindowname "$MT5_WID" 2>/dev/null)
+        echo "[JSR-AutoTrade] MT5 window found (ID: $MT5_WID, name: $WNAME) after ${elapsed}s"
         break
     fi
     sleep $POLL_INTERVAL
@@ -45,6 +53,4 @@ echo "[JSR-AutoTrade] Sending Ctrl+E to enable AutoTrading..."
 xdotool windowactivate --sync "$MT5_WID" key ctrl+e
 sleep 2
 
-# Verify by checking window title — when AutoTrading is ON, title doesn't change,
-# but we can test with an order via the bridge (done externally)
 echo "[JSR-AutoTrade] AutoTrading toggle sent. Done."
