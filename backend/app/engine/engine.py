@@ -80,7 +80,31 @@ SYMBOL_CONFIGS = {
         "sl_atr_mult": 2.0,  # Gold needs wider stops
         "tp_atr_mult": 2.5,
     },
+    "BTCUSD": {
+        "lot_size": 0.01,
+        "sl_atr_mult": 2.5,
+        "tp_atr_mult": 3.0,
+    },
 }
+
+TRADING_SYMBOLS_REDIS_KEY = "jsr:settings:trading_symbols"
+
+
+def _load_active_symbols_from_redis() -> Optional[List[str]]:
+    """Load user-configured active symbols from Redis, fallback to TRADING_SYMBOLS."""
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        raw = r.get(TRADING_SYMBOLS_REDIS_KEY)
+        if raw:
+            import json as _json
+            data = _json.loads(raw)
+            symbols = data.get("active_symbols", [])
+            if symbols:
+                return symbols
+    except Exception:
+        pass
+    return None
 
 
 class TradingEngine:
@@ -122,7 +146,7 @@ class TradingEngine:
         self._running = False  # Used by graceful shutdown signal handlers
         self._loop_interval = 5  # 5 seconds between cycles for real trading
         self._start_time: Optional[datetime] = None
-        self._symbols: List[str] = list(TRADING_SYMBOLS)
+        self._symbols: List[str] = _load_active_symbols_from_redis() or list(TRADING_SYMBOLS)
         # Track new candle detection per (symbol, timeframe) — not global
         self._last_candle_time: Dict[tuple, datetime] = {}  # {(symbol, timeframe): datetime}
 
@@ -461,7 +485,8 @@ class TradingEngine:
             if not self._using_synthetic:
                 try:
                     available_symbols = await self._data_feed.get_symbols()
-                    resolved = [s for s in TRADING_SYMBOLS if s in available_symbols]
+                    active = _load_active_symbols_from_redis() or TRADING_SYMBOLS
+                    resolved = [s for s in active if s in available_symbols]
                     if resolved:
                         self._symbols = resolved
                     else:

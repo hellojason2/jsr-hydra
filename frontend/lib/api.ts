@@ -174,4 +174,54 @@ export async function getTick(symbol: string): Promise<any> {
   return fetchApi<any>(`/api/system/tick/${symbol}`);
 }
 
+/**
+ * Trading Symbols Settings
+ */
+export interface TradingSymbolsConfig {
+  active_symbols: string[]
+  available_symbols: string[]
+  symbol_configs: Record<string, { lot_size: number; sl_atr_mult: number; tp_atr_mult: number }>
+}
+
+export async function getTradingSymbols(): Promise<TradingSymbolsConfig> {
+  return fetchApi<TradingSymbolsConfig>("/api/settings/trading-symbols")
+}
+
+export async function updateTradingSymbols(activeSymbols: string[]): Promise<TradingSymbolsConfig> {
+  return fetchApi<TradingSymbolsConfig>("/api/settings/trading-symbols", {
+    method: "PATCH",
+    body: JSON.stringify({ active_symbols: activeSymbols }),
+  })
+}
+
+/**
+ * LLM Configuration
+ */
+export interface LLMProviderInfo {
+  provider: string
+  configured: boolean
+  default_model: string
+  base_url: string
+}
+
+export interface LLMConfig {
+  enabled: boolean
+  provider: string
+  model: string
+  last_error: string | null
+  providers: LLMProviderInfo[]
+  models: Record<string, string[]>
+}
+
+export async function getLLMConfig(): Promise<LLMConfig> {
+  return fetchApi<LLMConfig>("/api/brain/llm-config")
+}
+
+export async function updateLLMConfig(provider: string, model?: string): Promise<LLMConfig> {
+  return fetchApi<LLMConfig>("/api/brain/llm-config", {
+    method: "PATCH",
+    body: JSON.stringify({ provider, model }),
+  })
+}
+
 export { BASE_URL };
