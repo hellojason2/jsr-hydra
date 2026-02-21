@@ -52,13 +52,30 @@ def _build_open_position_sync(
     2) Fallback to whichever source is available.
     """
     if mt5_positions and db_positions:
-        merged = list(mt5_positions)
+        # Build DB lookup by ticket for strategy enrichment
+        db_by_ticket: dict[str, dict] = {}
+        for db_pos in db_positions:
+            db_ticket = db_pos.get("ticket")
+            if db_ticket is not None:
+                db_by_ticket[str(db_ticket)] = db_pos
+
+        # Enrich MT5 positions with strategy metadata from DB
+        merged = []
+        for pos in mt5_positions:
+            enriched = dict(pos)
+            mt5_ticket = str(pos.get("ticket", ""))
+            db_match = db_by_ticket.get(mt5_ticket)
+            if db_match:
+                enriched.setdefault("strategy_code", db_match.get("strategy_code"))
+                enriched.setdefault("strategy_name", db_match.get("strategy_name"))
+            merged.append(enriched)
+
+        # Add DB-only positions (no MT5 match)
         mt5_tickets = {
             str(pos.get("ticket"))
             for pos in mt5_positions
             if pos.get("ticket") is not None
         }
-
         appended = 0
         for db_pos in db_positions:
             db_ticket = db_pos.get("ticket")

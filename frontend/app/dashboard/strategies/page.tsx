@@ -333,7 +333,7 @@ export default function StrategiesPage() {
                 <div className="text-2xl font-bold text-blue-400 mt-2">{(totalWinRate * 100).toFixed(1)}%</div>
               </Card>
               <Card className="p-4">
-                <div className="text-sm text-gray-400">Total Profit (30d)</div>
+                <div className="text-sm text-gray-400">Total Profit</div>
                 <div className={`text-2xl font-bold mt-2 ${totalProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                   ${totalProfit.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
@@ -495,7 +495,7 @@ export default function StrategiesPage() {
 
                         <div className="text-right ml-4 flex flex-col items-end gap-2">
                           <div>
-                            <div className="text-xs text-gray-500">30d Profit</div>
+                            <div className="text-xs text-gray-500">Total Profit</div>
                             <p className={`text-xl font-bold mt-1 ${(strategy.total_profit ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                               {strategy.total_profit !== undefined ? `$${strategy.total_profit.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '\u2014'}
                             </p>
