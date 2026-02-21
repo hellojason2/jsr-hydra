@@ -217,10 +217,12 @@ export async function getLLMConfig(): Promise<LLMConfig> {
   return fetchApi<LLMConfig>("/api/brain/llm-config")
 }
 
-export async function updateLLMConfig(provider: string, model?: string): Promise<LLMConfig> {
+export async function updateLLMConfig(provider: string, model?: string, apiKey?: string): Promise<LLMConfig> {
+  const payload: Record<string, string | undefined> = { provider, model }
+  if (apiKey) payload.api_key = apiKey
   return fetchApi<LLMConfig>("/api/brain/llm-config", {
     method: "PATCH",
-    body: JSON.stringify({ provider, model }),
+    body: JSON.stringify(payload),
   })
 }
 

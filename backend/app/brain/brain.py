@@ -155,6 +155,7 @@ class Brain:
         self._llm_provider: str = "none"
         self._llm_model: str = ""
         self._llm_last_error: Optional[str] = None
+        self._runtime_api_keys: Dict[str, str] = {}  # provider -> api_key set via API
         self._last_llm_config_sync: float = 0.0
 
         # Pending parameter updates from LLM recommendations
@@ -246,6 +247,10 @@ class Brain:
         return "openai"
 
     def _get_provider_api_key(self, provider: str) -> str:
+        # Check runtime keys (set via API) first, then fall back to env vars
+        runtime_key = getattr(self, "_runtime_api_keys", {}).get(provider, "")
+        if runtime_key:
+            return runtime_key
         if provider == "openai":
             return settings.OPENAI_API_KEY
         if provider == "zai":
@@ -293,6 +298,10 @@ class Brain:
             model = str(payload.get("model") or "").strip()
             if not model:
                 model = self._get_provider_default_model(provider)
+            # Restore runtime API key if persisted
+            api_key = payload.get("api_key")
+            if api_key:
+                self._runtime_api_keys[provider] = api_key
             return {
                 "provider": provider,
                 "model": model,
@@ -301,7 +310,7 @@ class Brain:
             logger.warning("brain_llm_config_load_failed", error=str(e))
             return None
 
-    def _persist_llm_config_to_redis(self, provider: str, model: str) -> None:
+    def _persist_llm_config_to_redis(self, provider: str, model: str, api_key: Optional[str] = None) -> None:
         """Persist shared LLM runtime config so API + engine stay in sync."""
         if not self._redis:
             return
@@ -311,6 +320,8 @@ class Brain:
                 "model": model,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+            if api_key:
+                payload["api_key"] = api_key
             self._redis.set(self.LLM_CONFIG_REDIS_KEY, json.dumps(payload))
         except Exception as e:
             logger.warning("brain_llm_config_persist_failed", error=str(e))
@@ -425,12 +436,16 @@ class Brain:
             },
         }
 
-    def set_llm_config(self, provider: str, model: Optional[str] = None) -> dict:
-        """Update provider/model at runtime and persist for all processes."""
+    def set_llm_config(self, provider: str, model: Optional[str] = None, api_key: Optional[str] = None) -> dict:
+        """Update provider/model/api_key at runtime and persist for all processes."""
         normalized_provider = (provider or "").strip().lower()
         if normalized_provider not in LLM_SUPPORTED_PROVIDERS:
             supported = ", ".join(LLM_SUPPORTED_PROVIDERS)
             raise ValueError(f"Unsupported provider '{provider}'. Supported providers: {supported}")
+
+        # Store runtime API key if provided
+        if api_key and api_key.strip():
+            self._runtime_api_keys[normalized_provider] = api_key.strip()
 
         selected_model = (model or "").strip() or self._get_provider_default_model(normalized_provider)
         self._apply_llm_config(
@@ -441,6 +456,7 @@ class Brain:
         self._persist_llm_config_to_redis(
             provider=normalized_provider,
             model=selected_model,
+            api_key=self._runtime_api_keys.get(normalized_provider),
         )
         return self.get_llm_config()
 

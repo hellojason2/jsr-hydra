@@ -256,6 +256,7 @@ async def get_rl_stats(
 class LLMConfigUpdate(BaseModel):
     provider: Literal["openai", "zai"]
     model: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 @router.get("/llm-config")
@@ -299,7 +300,7 @@ async def set_llm_config(
     """
     try:
         brain = get_brain()
-        return brain.set_llm_config(provider=body.provider, model=body.model)
+        return brain.set_llm_config(provider=body.provider, model=body.model, api_key=body.api_key)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

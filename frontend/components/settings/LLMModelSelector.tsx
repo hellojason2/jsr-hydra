@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { Brain, Check, Loader2, Save, AlertCircle, ChevronDown } from 'lucide-react'
+import { Brain, Check, Loader2, Save, AlertCircle, ChevronDown, Eye, EyeOff, KeyRound } from 'lucide-react'
 import { getLLMConfig, updateLLMConfig, LLMConfig } from '@/lib/api'
 
 const PROVIDER_DISPLAY: Record<string, { name: string; description: string }> = {
@@ -14,6 +14,8 @@ export function LLMModelSelector() {
   const [selectedProvider, setSelectedProvider] = useState<string>('')
   const [selectedModel, setSelectedModel] = useState<string>('')
   const [loading, setLoading] = useState(true)
+  const [apiKey, setApiKey] = useState<string>('')
+  const [showApiKey, setShowApiKey] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
@@ -55,16 +57,19 @@ export function LLMModelSelector() {
 
   const isDirty =
     config !== null &&
-    (selectedProvider !== config.provider || selectedModel !== config.model)
+    (selectedProvider !== config.provider || selectedModel !== config.model || apiKey.trim().length > 0)
 
   const handleApply = async () => {
     try {
       setSaving(true)
       setError(null)
-      const data = await updateLLMConfig(selectedProvider, selectedModel)
+      const trimmedKey = apiKey.trim() || undefined
+      const data = await updateLLMConfig(selectedProvider, selectedModel, trimmedKey)
       setConfig(data)
       setSelectedProvider(data.provider)
       setSelectedModel(data.model)
+      setApiKey('')
+      setShowApiKey(false)
       setSuccess(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update LLM configuration')
@@ -208,6 +213,42 @@ export function LLMModelSelector() {
                 ))}
               </select>
               <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500 pointer-events-none" />
+            </div>
+          </div>
+
+          {/* API Key Input */}
+          <div className="mb-6">
+            <label className="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wider">
+              <div className="flex items-center gap-1.5">
+                <KeyRound className="w-3 h-3" />
+                API Key
+              </div>
+            </label>
+            <div className="relative">
+              <input
+                type={showApiKey ? 'text' : 'password'}
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={
+                  config?.providers.find((p) => p.provider === selectedProvider)?.configured
+                    ? 'Key is set — enter new key to replace'
+                    : 'Enter API key for this provider'
+                }
+                className="
+                  w-full px-4 py-3 pr-12 rounded-xl
+                  bg-gray-900/70 border border-gray-700 text-gray-200
+                  text-sm font-mono placeholder-gray-600
+                  focus:outline-none focus:border-[#00d97e]/50 focus:ring-1 focus:ring-[#00d97e]/20
+                  transition-all duration-200
+                "
+              />
+              <button
+                type="button"
+                onClick={() => setShowApiKey(!showApiKey)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
             </div>
           </div>
 
