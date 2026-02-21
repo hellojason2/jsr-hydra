@@ -942,7 +942,7 @@ class TradingEngine:
 
                 try:
                     # Check market hours
-                    if not time_utils.is_market_open():
+                    if not any(time_utils.is_market_open(s) for s in self._symbols):
                         logger.debug(
                             "market_closed",
                             cycle=cycle_count,

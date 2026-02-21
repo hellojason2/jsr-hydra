@@ -6,6 +6,9 @@ Handles UTC-based calculations for forex, crypto, and news event windows.
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+# Crypto symbols that trade 24/7
+CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD"}
+
 
 def get_utc_now() -> datetime:
     """
@@ -28,6 +31,10 @@ def is_market_open(symbol: str = "XAUUSD") -> bool:
     Returns:
         bool: True if market is currently within trading hours, False otherwise.
     """
+    # Crypto trades 24/7
+    if symbol.upper() in CRYPTO_SYMBOLS:
+        return True
+
     now = get_utc_now()
     current_weekday = now.weekday()  # Monday=0, Sunday=6
     current_hour_utc = now.hour

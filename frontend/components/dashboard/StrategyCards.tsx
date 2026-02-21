@@ -15,6 +15,14 @@ interface Strategy {
   profitFactor?: number
 }
 
+const STRATEGY_FREQUENCY: Record<string, { label: string; color: string }> = {
+  A: { label: '~1h', color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20' },
+  B: { label: '~1h', color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20' },
+  C: { label: '~1h', color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20' },
+  D: { label: '~5m', color: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' },
+  E: { label: '~5m', color: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' },
+}
+
 interface StrategyCardsProps {
   strategies?: Strategy[]
   loading?: boolean
@@ -41,7 +49,14 @@ function StrategyItem({ strategy }: StrategyItemProps) {
     <div className="bg-black/30 border border-gray-700 rounded-lg p-4 hover:border-gray-600 transition-all">
       <div className="flex justify-between items-start mb-3">
         <div>
-          <p className="text-sm font-semibold text-gray-200">Strategy {strategy.code}</p>
+          <div className="flex items-center gap-1.5">
+            <p className="text-sm font-semibold text-gray-200">Strategy {strategy.code}</p>
+            {STRATEGY_FREQUENCY[strategy.code] && (
+              <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${STRATEGY_FREQUENCY[strategy.code].color}`}>
+                {STRATEGY_FREQUENCY[strategy.code].label}
+              </span>
+            )}
+          </div>
           <p className="text-xs text-gray-400 mt-1">{strategy.name}</p>
         </div>
         <Badge variant={variant} dot>
