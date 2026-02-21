@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     ZAI_MODEL: str = "glm-4.6"
     ZAI_BASE_URL: str = "https://api.z.ai/api/paas/v4/chat/completions"
 
+    # Finnhub API Key (free tier — register at finnhub.io)
+    # Used for economic calendar data in sentiment module
+    FINNHUB_API_KEY: str = ""
+
     # Brain runtime selection (openai | zai)
     BRAIN_LLM_PROVIDER: str = "openai"
     # Writable directory for brain persistence files (memory, XP, allocator, RL state)

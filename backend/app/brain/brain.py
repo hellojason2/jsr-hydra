@@ -1515,27 +1515,50 @@ class Brain:
         )
 
     async def _llm_analyze_market(self, market_data: Dict) -> None:
-        """Fire LLM market analysis and add result as a thought."""
+        """Fire LLM market analysis with bull/bear debate pipeline."""
         try:
+            # Step 1: Run the standard analysis (sentiment-aware)
             insight = await self._llm.analyze_market(market_data)
             self._ingest_llm_insight(
                 insight=insight,
                 insight_type="market_analysis",
                 success_confidence=0.8,
             )
+
+            # Step 2: Run bull/bear debate for structured signal
+            debate_result = await self._llm.bull_bear_debate(market_data)
+            if debate_result:
+                self._ingest_llm_insight(
+                    insight={"content": json.dumps(debate_result.get("verdict", {})), "type": "bull_bear_debate"},
+                    insight_type="bull_bear_debate",
+                    success_confidence=debate_result.get("verdict", {}).get("conviction", 0.5),
+                )
+
+                # Step 3: Extract actionable signal from debate
+                signal_result = await self._llm.extract_signal(debate_result, market_data)
+                if signal_result:
+                    self._apply_llm_signal(signal_result)
+
         except Exception as e:
             self._set_llm_runtime_error(str(e), context="market_analysis")
             logger.warning("llm_market_analysis_failed", error=str(e))
 
     async def _llm_review_trade(self, trade_data: Dict) -> None:
-        """Fire LLM trade review and add result as a thought."""
+        """Fire LLM trade review with structured reflection pipeline."""
         try:
+            # Step 1: Standard review (memory-aware, sentiment-aware)
             insight = await self._llm.review_trade(trade_data)
             self._ingest_llm_insight(
                 insight=insight,
                 insight_type="trade_review",
                 success_confidence=0.75,
             )
+
+            # Step 2: Structured trade reflection for actionable adjustments
+            reflection = await self._llm.structured_trade_review(trade_data)
+            if reflection:
+                self._apply_trade_reflection(reflection, trade_data)
+
         except Exception as e:
             self._set_llm_runtime_error(str(e), context="trade_review")
             logger.warning("llm_trade_review_failed", error=str(e))
@@ -1596,6 +1619,131 @@ class Brain:
         except Exception as e:
             self._set_llm_runtime_error(str(e), context="loss_diagnosis")
             logger.warning("llm_loss_diagnosis_failed", error=str(e))
+
+    # ════════════════════════════════════════════════════════════════
+    # Structured LLM Signal Application
+    # ════════════════════════════════════════════════════════════════
+
+    def _apply_llm_signal(self, signal_result: Dict) -> None:
+        """
+        Apply a structured LLM signal to the brain's strategy scores.
+
+        Bridges the gap between LLM analysis and actual trading decisions
+        by adjusting strategy confidence based on signal_result from extract_signal().
+        """
+        try:
+            signal = signal_result.get("signal", "HOLD")
+            confidence = signal_result.get("confidence", 0)
+            strategy_prefs = signal_result.get("strategy_preferences", {})
+            risk_adj = signal_result.get("risk_adjustment", "NORMAL")
+
+            # Only apply if confidence is meaningful
+            if confidence < 0.3:
+                logger.debug("llm_signal_low_confidence", confidence=confidence)
+                return
+
+            # Adjust strategy scores based on LLM preferences
+            for code, pref in strategy_prefs.items():
+                if code not in self._strategy_scores:
+                    continue
+                current = self._strategy_scores[code].get("confidence", 50)
+                # Scale adjustment: pref is -1.0 to 1.0, map to -15 to +15 points
+                adjustment = pref * 15.0 * confidence
+                new_confidence = max(0, min(100, current + adjustment))
+                self._strategy_scores[code]["confidence"] = round(new_confidence, 1)
+                self._strategy_scores[code]["llm_signal"] = signal
+                self._strategy_scores[code]["llm_pref"] = round(pref, 2)
+
+            # Apply risk adjustment to pending parameter updates
+            if risk_adj == "TIGHTEN":
+                self._pending_parameter_updates["_risk"] = {"lot_scale": 0.75}
+            elif risk_adj == "LOOSEN":
+                self._pending_parameter_updates["_risk"] = {"lot_scale": 1.25}
+            else:
+                self._pending_parameter_updates.pop("_risk", None)
+
+            # Store key levels if provided
+            key_levels = signal_result.get("key_levels", {})
+            if key_levels:
+                self._market_analysis["key_levels"] = key_levels
+
+            # Add thought about signal application
+            self._add_thought(
+                "DECISION",
+                f"LLM signal: {signal} (confidence {confidence:.0%}). "
+                f"Risk: {risk_adj}. "
+                f"Strategy prefs: {', '.join(f'{k}={v:+.1f}' for k, v in strategy_prefs.items() if abs(v) > 0.1)}",
+                confidence=confidence,
+                metadata={"source": "llm_signal", "signal": signal, "risk": risk_adj},
+            )
+
+            logger.info(
+                "llm_signal_applied",
+                signal=signal,
+                confidence=confidence,
+                risk=risk_adj,
+                adjustments={k: v for k, v in strategy_prefs.items() if abs(v) > 0.1},
+            )
+        except Exception as e:
+            logger.warning("llm_signal_apply_failed", error=str(e))
+
+    def _apply_trade_reflection(self, reflection: Dict, trade_data: Dict) -> None:
+        """
+        Apply structured trade reflection to strategy confidence and XP.
+
+        Feeds the structured lesson from the LLM back into the brain's
+        learning systems (strategy scores, XP adjustments).
+        """
+        try:
+            adjustment = reflection.get("strategy_adjustment", {})
+            strategy_code = adjustment.get("strategy", trade_data.get("strategy", ""))
+            direction = adjustment.get("direction", "NEUTRAL")
+            magnitude = adjustment.get("magnitude", 0)
+
+            if not strategy_code or direction == "NEUTRAL" or magnitude < 0.1:
+                return
+
+            # Adjust strategy confidence
+            if strategy_code in self._strategy_scores:
+                current = self._strategy_scores[strategy_code].get("confidence", 50)
+                if direction == "BOOST":
+                    delta = magnitude * 10.0  # 0-10 point boost
+                elif direction == "PENALIZE":
+                    delta = -magnitude * 10.0  # 0-10 point penalty
+                else:
+                    delta = 0
+                new_confidence = max(0, min(100, current + delta))
+                self._strategy_scores[strategy_code]["confidence"] = round(new_confidence, 1)
+
+            # Add a learning thought
+            outcome = reflection.get("outcome_quality", "?")
+            lesson = reflection.get("lesson", "")
+            root_cause = reflection.get("root_cause", "")
+
+            self._add_thought(
+                "LEARNING",
+                f"Trade reflection [{outcome}]: {root_cause} "
+                f"Lesson: {lesson} "
+                f"Adjustment: {strategy_code} {direction} ({magnitude:.1f})",
+                confidence=0.7,
+                metadata={
+                    "source": "trade_reflection",
+                    "strategy": strategy_code,
+                    "direction": direction,
+                    "magnitude": magnitude,
+                    "outcome": outcome,
+                },
+            )
+
+            logger.info(
+                "trade_reflection_applied",
+                strategy=strategy_code,
+                direction=direction,
+                magnitude=magnitude,
+                outcome=outcome,
+            )
+        except Exception as e:
+            logger.warning("trade_reflection_apply_failed", error=str(e))
 
     # ════════════════════════════════════════════════════════════════
     # Internal Thought Generation

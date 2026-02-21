@@ -20,7 +20,8 @@ STRATEGY_DESC = {
     "A": "Trend Following (EMA crossover + ADX)",
     "B": "Mean Reversion (Bollinger + Z-score)",
     "C": "Session Breakout",
-    "D": "Volatility Harvester (BB + RSI)",
+    "D": "Momentum Scalper (BB + RSI)",
+    "E": "Range Scalper (Sideways)",
 }
 
 
@@ -505,3 +506,129 @@ def risk_event_thought(event_type: str, details: dict) -> str:
     )
 
     return thought
+
+
+# ---------------------------------------------------------------------------
+# STRUCTURED LLM ANALYSIS PROMPTS
+# Adapted from TradingAgents multi-agent debate pattern (single-call variant)
+# ---------------------------------------------------------------------------
+
+BULL_BEAR_DEBATE_SYSTEM = """You are a senior market analyst conducting an internal bull vs bear debate.
+You will argue BOTH sides of a trade, then render a verdict.
+
+You MUST respond in this exact JSON format and nothing else:
+{
+  "bull_case": {
+    "thesis": "<2-3 sentence bullish argument>",
+    "key_evidence": ["<point1>", "<point2>", "<point3>"],
+    "confidence": <0.0 to 1.0>
+  },
+  "bear_case": {
+    "thesis": "<2-3 sentence bearish argument>",
+    "key_evidence": ["<point1>", "<point2>", "<point3>"],
+    "confidence": <0.0 to 1.0>
+  },
+  "verdict": {
+    "direction": "<BULLISH|BEARISH|NEUTRAL>",
+    "conviction": <0.0 to 1.0>,
+    "reasoning": "<1-2 sentences on why this side wins>"
+  }
+}
+
+Rules:
+- Be specific: cite actual indicator values, price levels, regime context
+- Bull and bear confidence should NOT sum to 1.0 — they are independent
+- Verdict conviction should reflect how lopsided the evidence is
+- If the case is genuinely unclear, set conviction below 0.3
+- Do NOT add any text outside the JSON object"""
+
+BULL_BEAR_DEBATE_USER = """Conduct a bull vs bear analysis for {symbol}:
+
+Current price: {price}
+Regime: {regime}
+RSI: {rsi}
+ADX: {adx}
+ATR: {atr}
+EMA20: {ema_20}
+EMA50: {ema_50}
+Spread: {spread}
+Account balance: ${balance:.2f}
+Open positions: {open_positions}
+Today's P&L: ${daily_pnl:.2f}"""
+
+
+SIGNAL_EXTRACTION_SYSTEM = """You are a quantitative signal processor.
+Given market analysis and debate results, produce a trading signal.
+
+You MUST respond in this exact JSON format and nothing else:
+{
+  "signal": "<BUY|SELL|HOLD>",
+  "confidence": <0.0 to 1.0>,
+  "strategy_preferences": {
+    "A": <-1.0 to 1.0>,
+    "B": <-1.0 to 1.0>,
+    "C": <-1.0 to 1.0>,
+    "D": <-1.0 to 1.0>,
+    "E": <-1.0 to 1.0>
+  },
+  "risk_adjustment": "<TIGHTEN|NORMAL|LOOSEN>",
+  "key_levels": {
+    "support": <price or null>,
+    "resistance": <price or null>
+  },
+  "reasoning": "<1 sentence>"
+}
+
+Strategy reference:
+A = Trend Following (EMA crossover + ADX) — favored in trending regimes
+B = Mean Reversion (Bollinger + Z-score) — favored in ranging regimes
+C = Session Breakout — favored in quiet-to-volatile transitions
+D = Momentum Scalper (BB + RSI) — favored in volatile regimes
+E = Range Scalper — favored in sideways markets
+
+strategy_preferences: positive = favor, negative = disfavor, 0 = neutral
+risk_adjustment: TIGHTEN = reduce lot sizes, LOOSEN = increase, NORMAL = no change
+
+Do NOT add any text outside the JSON object."""
+
+SIGNAL_EXTRACTION_USER = """Extract a trading signal from this analysis:
+
+Bull case: {bull_thesis} (confidence: {bull_confidence})
+Bear case: {bear_thesis} (confidence: {bear_confidence})
+Verdict: {verdict_direction} (conviction: {verdict_conviction})
+Reasoning: {verdict_reasoning}
+
+Current regime: {regime}
+RSI: {rsi}
+ADX: {adx}
+Current drawdown: {drawdown_pct:.2f}%"""
+
+
+TRADE_REFLECTION_SYSTEM = """You are a trading performance analyst.
+Review this completed trade and extract structured lessons.
+
+You MUST respond in this exact JSON format and nothing else:
+{
+  "outcome_quality": "<GOOD_ENTRY_GOOD_EXIT|GOOD_ENTRY_BAD_EXIT|BAD_ENTRY_GOOD_EXIT|BAD_ENTRY_BAD_EXIT>",
+  "root_cause": "<1 sentence: what drove the outcome>",
+  "lesson": "<1 sentence: actionable takeaway>",
+  "strategy_adjustment": {
+    "strategy": "<A|B|C|D|E>",
+    "direction": "<BOOST|PENALIZE|NEUTRAL>",
+    "magnitude": <0.0 to 1.0>
+  },
+  "regime_note": "<1 sentence: how regime affected this trade>"
+}
+
+Do NOT add any text outside the JSON object."""
+
+TRADE_REFLECTION_USER = """Review this trade:
+
+Symbol: {symbol}
+Strategy: {strategy}
+Direction: {direction}
+Entry: {entry_price}
+Exit: {exit_price}
+P&L: ${profit:.2f}
+Regime at entry: {regime}
+Win/Loss: {outcome}"""

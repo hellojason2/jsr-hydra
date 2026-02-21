@@ -9,15 +9,35 @@ NOT called every cycle -- called on specific triggers to save costs:
 2. On trade close: Trade review and lessons learned
 3. Every hour: Strategy performance review
 4. On regime change: Regime analysis and strategy recommendations
+
+ENHANCEMENTS (v2):
+- Hierarchical memory (short/medium/long-term) via LLMMemory
+- Structured JSON output parsing via StructuredOutputParser
+- Memory context injection into all LLM prompts
+- Importance-scored memory entries with automatic promotion/decay
 """
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 import httpx
 
+from app.brain.llm_memory import LLMMemory
+from app.brain.llm_structured import (
+    StructuredOutputParser,
+    MarketSignal,
+    TradeReview,
+    StrategyAdvice,
+    RegimeInsight,
+    LossDiagnosis,
+    compute_importance_from_signal,
+    compute_importance_from_review,
+    compute_importance_from_diagnosis,
+)
+from app.brain.sentiment import get_sentiment_data, format_sentiment_for_prompt
 from app.utils.logger import get_logger
 
 logger = get_logger("brain.llm")
@@ -58,6 +78,10 @@ class LLMBrain:
         self._last_loss_diagnosis_time = 0
         self._insights_history: List[Dict] = []  # Rolling list of LLM insights
         self._max_insights = 50
+
+        # v2: Hierarchical memory and structured output parser
+        self._memory = LLMMemory()
+        self._parser = StructuredOutputParser()
 
         logger.info(
             "llm_brain_initialized",
@@ -245,36 +269,91 @@ class LLMBrain:
             return None  # Too soon
         self._last_analysis_time = now
 
-        system_prompt = """You are an expert forex and commodities trader AI assistant.
-You analyze market data and provide concise, actionable trading insights.
-Keep responses under 200 words. Be specific about price levels and conditions.
-Format: Start with a 1-line summary, then bullet points for key observations and recommendations."""
+        # Fetch sentiment/news data concurrently before building prompt
+        from app.config.settings import settings as _settings
+        finnhub_key = getattr(_settings, "FINNHUB_API_KEY", "") or None
+        try:
+            sentiment_data = await get_sentiment_data(finnhub_api_key=finnhub_key)
+            sentiment_block = format_sentiment_for_prompt(sentiment_data)
+        except Exception as e:
+            logger.warning("sentiment_fetch_for_prompt_failed", error=str(e))
+            sentiment_block = "(Sentiment data unavailable this cycle)"
+
+        # Retrieve memory context for this analysis
+        regime = market_data.get('regime', 'Unknown')
+        symbols = market_data.get('symbols', [])
+        memory_context = self._memory.get_context_for_prompt(
+            source_type="market_analysis",
+            regime=regime,
+            symbol=symbols[0] if symbols else None,
+        )
+        schema_instruction = self._parser.get_schema_instruction("market_signal")
+
+        system_prompt = f"""You are an expert forex, crypto, and commodities trader AI assistant.
+You analyze market data AND sentiment/news context to provide concise, actionable trading insights.
+Be specific about price levels and conditions.
+When sentiment data is available, factor it into your analysis:
+- Fear & Greed extremes are contrarian indicators (extreme fear = potential buy, extreme greed = potential sell)
+- Upcoming high-impact economic events (NFP, CPI, FOMC) mean: avoid new positions 30 min before/after
+- News headlines provide qualitative context for momentum shifts
+
+{schema_instruction}"""
 
         user_prompt = f"""Analyze these current market conditions:
 
-Symbols being traded: {', '.join(market_data.get('symbols', []))}
+{memory_context}
+=== TECHNICAL DATA ===
+Symbols being traded: {', '.join(symbols)}
 
 For each symbol:
 {json.dumps(market_data.get('symbol_data', {}), indent=2, default=str)}
 
-Current regime: {market_data.get('regime', 'Unknown')}
+Current regime: {regime}
 ADX: {market_data.get('adx', 'N/A')}
 RSI: {market_data.get('rsi', 'N/A')}
 Account balance: ${market_data.get('balance', 0):.2f}
 Open positions: {market_data.get('open_positions', 0)}
 Today's P&L: ${market_data.get('daily_pnl', 0):.2f}
 
-What are the key things to watch? Any dangers? Best opportunities right now?"""
+{sentiment_block}
 
-        response = await self._call_gpt(system_prompt, user_prompt)
+Based on BOTH the technical indicators AND the sentiment/news data above:
+1. What are the key things to watch?
+2. Any dangers from upcoming events or extreme sentiment?
+3. Best opportunities right now?
+4. Should we avoid trading due to upcoming high-impact news?"""
+
+        response = await self._call_gpt(system_prompt, user_prompt, max_tokens=600)
         if response:
+            # Parse structured output
+            signal, raw_text = self._parser.parse_market_signal(response)
+            importance = compute_importance_from_signal(signal)
+
+            # Store in hierarchical memory
+            if not self._is_error_content(response):
+                self._memory.add(
+                    text=signal.summary or raw_text[:300],
+                    source_type="market_analysis",
+                    importance=importance,
+                    tags=[signal.sentiment, regime],
+                    symbol=symbols[0] if symbols else "",
+                    regime=regime,
+                )
+                self._memory.step()  # Run decay/promote cycle
+
             insight = self._build_insight(
                 "market_analysis",
-                response,
-                tokens_used=self._total_tokens_used,  # cumulative for stats display
+                raw_text,
+                tokens_used=self._total_tokens_used,
+                structured=signal.to_dict(),
             )
             self._store_insight(insight)
-            logger.info("llm_market_analysis_complete", content_length=len(response))
+            logger.info(
+                "llm_market_analysis_complete",
+                content_length=len(response),
+                sentiment=signal.sentiment,
+                confidence=signal.confidence,
+            )
             return insight
         return None
 
@@ -294,19 +373,31 @@ What are the key things to watch? Any dangers? Best opportunities right now?"""
 
         CALLED BY: brain/brain.py process_trade_result (via asyncio.create_task)
         """
-        system_prompt = """You are a trading coach reviewing a completed trade.
-Provide a brief analysis (under 150 words) of:
-1. What went right or wrong
-2. One specific lesson learned
-3. One suggestion for improvement
-Be constructive and specific. Reference actual numbers."""
-
         profit = trade_data.get('profit', 0)
+        symbol = trade_data.get('symbol', '')
+        strategy = trade_data.get('strategy', '')
+        regime = trade_data.get('regime', 'N/A')
+
+        # Retrieve memory context: past reviews for same symbol/strategy
+        memory_context = self._memory.get_context_for_prompt(
+            source_type="trade_review",
+            symbol=symbol,
+            max_short=2, max_medium=2, max_long=2,
+        )
+        schema_instruction = self._parser.get_schema_instruction("trade_review")
+
+        system_prompt = f"""You are a trading coach reviewing a completed trade.
+Analyze what went right or wrong, provide lessons and improvement suggestions.
+Be constructive and specific. Reference actual numbers.
+
+{schema_instruction}"""
+
         user_prompt = f"""Review this completed trade:
 
-Symbol: {trade_data.get('symbol')}
+{memory_context}
+Symbol: {symbol}
 Direction: {trade_data.get('direction')}
-Strategy: {trade_data.get('strategy')}
+Strategy: {strategy}
 Entry: {trade_data.get('entry_price')}
 Exit: {trade_data.get('exit_price')}
 P&L: ${profit:.2f}
@@ -314,22 +405,45 @@ Duration: {trade_data.get('duration_minutes', 0)} minutes
 Stop Loss: {trade_data.get('sl_price')}
 Take Profit: {trade_data.get('tp_price')}
 RSI at entry: {trade_data.get('rsi_at_entry', 'N/A')}
-Regime at entry: {trade_data.get('regime', 'N/A')}
+Regime at entry: {regime}
 Win/Loss: {'WIN' if profit > 0 else 'LOSS'}"""
 
         response = await self._call_gpt(system_prompt, user_prompt)
         if response:
+            # Parse structured output
+            review, raw_text = self._parser.parse_trade_review(response)
+            importance = compute_importance_from_review(review)
+
+            # Store in hierarchical memory
+            if not self._is_error_content(response):
+                tags = list(review.pattern_tags) + [
+                    "win" if profit > 0 else "loss",
+                    review.grade,
+                ]
+                self._memory.add(
+                    text=f"[{review.grade}] {'; '.join(review.lessons)}" if review.lessons else raw_text[:300],
+                    source_type="trade_review",
+                    importance=importance,
+                    tags=tags,
+                    symbol=symbol,
+                    regime=regime,
+                    strategy=strategy,
+                    pnl=profit,
+                )
+
             insight = self._build_insight(
                 "trade_review",
-                response,
-                trade_symbol=trade_data.get("symbol"),
+                raw_text,
+                trade_symbol=symbol,
                 trade_pnl=profit,
+                structured=review.to_dict(),
             )
             self._store_insight(insight)
             logger.info(
                 "llm_trade_review_complete",
-                symbol=trade_data.get('symbol'),
+                symbol=symbol,
                 pnl=profit,
+                grade=review.grade,
             )
             return insight
         return None
@@ -354,14 +468,22 @@ Win/Loss: {'WIN' if profit > 0 else 'LOSS'}"""
             return None
         self._last_review_time = now
 
-        system_prompt = """You are a quantitative trading system optimizer.
+        # Retrieve memory context: past strategy reviews
+        memory_context = self._memory.get_context_for_prompt(
+            source_type="strategy_review",
+            max_short=2, max_medium=3, max_long=2,
+        )
+        schema_instruction = self._parser.get_schema_instruction("strategy_advice")
+
+        system_prompt = f"""You are a quantitative trading system optimizer.
 Review strategy performance and suggest specific parameter changes.
 Be precise -- suggest exact numbers for thresholds.
-Keep response under 250 words.
-Format as: Strategy [X]: [observation]. Suggestion: [specific change]."""
+
+{schema_instruction}"""
 
         user_prompt = f"""Review these strategy performances over the last hour:
 
+{memory_context}
 {json.dumps(strategy_stats, indent=2, default=str)}
 
 For each strategy, suggest:
@@ -372,7 +494,23 @@ For each strategy, suggest:
 
         response = await self._call_gpt(system_prompt, user_prompt, max_tokens=600)
         if response:
-            insight = self._build_insight("strategy_review", response)
+            # Parse structured output
+            advice, raw_text = self._parser.parse_strategy_advice(response)
+
+            # Store in hierarchical memory
+            if not self._is_error_content(response):
+                self._memory.add(
+                    text=advice.summary or raw_text[:300],
+                    source_type="strategy_review",
+                    importance=0.5,
+                    tags=["strategy_review", advice.highest_edge] if advice.highest_edge else ["strategy_review"],
+                )
+
+            insight = self._build_insight(
+                "strategy_review",
+                raw_text,
+                structured=advice.to_dict(),
+            )
             self._store_insight(insight)
             logger.info("llm_strategy_review_complete", content_length=len(response))
             return insight
@@ -395,12 +533,23 @@ For each strategy, suggest:
 
         CALLED BY: brain/brain.py process_cycle (via asyncio.create_task)
         """
-        system_prompt = """You are a market regime analyst. When market conditions shift,
+        # Retrieve memory context: past regime transitions
+        memory_context = self._memory.get_context_for_prompt(
+            source_type="regime_analysis",
+            regime=new_regime,
+            max_short=2, max_medium=2, max_long=3,
+        )
+        schema_instruction = self._parser.get_schema_instruction("regime_insight")
+
+        system_prompt = f"""You are a market regime analyst. When market conditions shift,
 explain what it means for different trading strategies and what to watch for.
-Keep it under 150 words. Be actionable."""
+Be actionable.
+
+{schema_instruction}"""
 
         user_prompt = f"""Market regime just changed from {old_regime} to {new_regime}.
 
+{memory_context}
 Current indicators:
 RSI: {indicators.get('rsi', 'N/A')}
 ADX: {indicators.get('adx', 'N/A')}
@@ -413,17 +562,35 @@ Any specific price levels to watch?"""
 
         response = await self._call_gpt(system_prompt, user_prompt)
         if response:
+            # Parse structured output
+            regime_insight, raw_text = self._parser.parse_regime_insight(response)
+
+            # Store in hierarchical memory with high importance (regime changes are significant)
+            if not self._is_error_content(response):
+                self._memory.add(
+                    text=regime_insight.summary or raw_text[:300],
+                    source_type="regime_analysis",
+                    importance=0.7,  # Regime changes are always important
+                    tags=[
+                        f"from_{old_regime}", f"to_{new_regime}",
+                        regime_insight.risk_level,
+                    ],
+                    regime=new_regime,
+                )
+
             insight = self._build_insight(
                 "regime_analysis",
-                response,
+                raw_text,
                 old_regime=old_regime,
                 new_regime=new_regime,
+                structured=regime_insight.to_dict(),
             )
             self._store_insight(insight)
             logger.info(
                 "llm_regime_analysis_complete",
                 old_regime=old_regime,
                 new_regime=new_regime,
+                risk_level=regime_insight.risk_level,
             )
             return insight
         return None
@@ -440,17 +607,32 @@ Any specific price levels to watch?"""
             return None
         self._last_loss_diagnosis_time = now
 
-        system_prompt = """You are a quantitative trading diagnostician.
+        # Retrieve memory context: past diagnoses and recent trade reviews
+        memory_context = self._memory.get_context_for_prompt(
+            source_type="loss_diagnosis",
+            max_short=2, max_medium=3, max_long=3,
+        )
+        # Also pull in recent losing trade reviews for additional context
+        loss_memories = self._memory.query(
+            source_type="trade_review", tags=["loss"], limit=3,
+        )
+        loss_context = ""
+        if loss_memories:
+            loss_items = "\n".join(
+                f"  - {m.text[:150]}" for m in loss_memories
+            )
+            loss_context = f"\n[Recent Loss Trade Reviews]\n{loss_items}\n"
+
+        schema_instruction = self._parser.get_schema_instruction("loss_diagnosis")
+
+        system_prompt = f"""You are a quantitative trading diagnostician.
 Given strategy/symbol performance stats from an automated system, identify why it is losing.
-Respond with:
-1) Top 3 root causes
-2) Immediate risk controls (position sizing, pausing, filters)
-3) Concrete rule changes by strategy and symbol
-4) A short reinforcement-learning adjustment plan
-Keep it under 260 words and be specific."""
+
+{schema_instruction}"""
 
         user_prompt = f"""Diagnose this automated trading system performance snapshot:
 
+{memory_context}{loss_context}
 {json.dumps(performance_snapshot, indent=2, default=str)}
 
 Focus on:
@@ -462,11 +644,260 @@ Focus on:
 
         response = await self._call_gpt(system_prompt, user_prompt, max_tokens=700)
         if response:
-            insight = self._build_insight("loss_diagnosis", response)
+            # Parse structured output
+            diagnosis, raw_text = self._parser.parse_loss_diagnosis(response)
+            importance = compute_importance_from_diagnosis(diagnosis)
+
+            # Store in hierarchical memory
+            if not self._is_error_content(response):
+                self._memory.add(
+                    text=diagnosis.recovery_plan or raw_text[:300],
+                    source_type="loss_diagnosis",
+                    importance=importance,
+                    tags=["loss_diagnosis", diagnosis.severity],
+                )
+
+            insight = self._build_insight(
+                "loss_diagnosis",
+                raw_text,
+                structured=diagnosis.to_dict(),
+            )
             self._store_insight(insight)
-            logger.info("llm_loss_diagnosis_complete", content_length=len(response))
+            logger.info(
+                "llm_loss_diagnosis_complete",
+                content_length=len(response),
+                severity=diagnosis.severity,
+            )
             return insight
         return None
+
+    # ------------------------------------------------------------------ #
+    #  Structured JSON Output Helpers
+    # ------------------------------------------------------------------ #
+
+    def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract a JSON object from an LLM response, handling markdown fences."""
+        if not text or self._is_error_content(text):
+            return None
+        # Strip markdown code fences if present
+        cleaned = re.sub(r"```(?:json)?\s*", "", text).strip()
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Try to find JSON object in the text
+            match = re.search(r"\{[\s\S]*\}", cleaned)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+            logger.warning("json_parse_failed", text_preview=text[:120])
+            return None
+
+    # ------------------------------------------------------------------ #
+    #  Bull vs Bear Debate (TradingAgents pattern)
+    # ------------------------------------------------------------------ #
+
+    async def bull_bear_debate(self, market_data: Dict) -> Optional[Dict]:
+        """
+        Run a structured bull vs bear adversarial analysis for a symbol.
+        Returns parsed JSON with bull_case, bear_case, and verdict.
+
+        CALLED BY: brain.py _llm_analyze_market (enhanced pipeline)
+        """
+        from app.brain.prompts import BULL_BEAR_DEBATE_SYSTEM, BULL_BEAR_DEBATE_USER
+
+        symbols = market_data.get("symbols", [])
+        symbol = symbols[0] if symbols else "EURUSD"
+        symbol_data = market_data.get("symbol_data", {})
+        sym_info = symbol_data.get(symbol, {})
+        indicators = sym_info.get("indicators", {})
+
+        user_prompt = BULL_BEAR_DEBATE_USER.format(
+            symbol=symbol,
+            price=sym_info.get("bid", indicators.get("price", "N/A")),
+            regime=market_data.get("regime", "UNKNOWN"),
+            rsi=indicators.get("rsi", "N/A"),
+            adx=indicators.get("adx", "N/A"),
+            atr=indicators.get("atr", "N/A"),
+            ema_20=indicators.get("ema_20", indicators.get("ema20", "N/A")),
+            ema_50=indicators.get("ema_50", indicators.get("ema50", "N/A")),
+            spread=sym_info.get("spread", "N/A"),
+            balance=market_data.get("balance", 0),
+            open_positions=market_data.get("open_positions", 0),
+            daily_pnl=market_data.get("daily_pnl", 0),
+        )
+
+        response = await self._call_gpt_with_retry(
+            BULL_BEAR_DEBATE_SYSTEM, user_prompt, max_tokens=600
+        )
+        if not response or self._is_error_content(response):
+            return None
+
+        parsed = self._parse_json_response(response)
+        if not parsed or "verdict" not in parsed:
+            logger.warning("debate_parse_failed", response_preview=response[:100])
+            return None
+
+        insight = self._build_insight(
+            "bull_bear_debate",
+            response,
+            symbol=symbol,
+            structured=parsed,
+        )
+        self._store_insight(insight)
+
+        # Store in memory
+        verdict = parsed.get("verdict", {})
+        self._memory.add(
+            text=f"[{symbol}] Debate verdict: {verdict.get('direction', '?')} "
+                 f"(conviction {verdict.get('conviction', 0):.2f}) — {verdict.get('reasoning', '')}",
+            source_type="debate",
+            importance=max(0.4, verdict.get("conviction", 0.5)),
+            tags=[verdict.get("direction", "NEUTRAL"), symbol],
+            symbol=symbol,
+            regime=market_data.get("regime", ""),
+        )
+
+        logger.info(
+            "debate_complete",
+            symbol=symbol,
+            direction=verdict.get("direction"),
+            conviction=verdict.get("conviction"),
+        )
+        return parsed
+
+    # ------------------------------------------------------------------ #
+    #  Signal Extraction (debate results -> actionable signal)
+    # ------------------------------------------------------------------ #
+
+    async def extract_signal(self, debate_result: Dict, market_data: Dict) -> Optional[Dict]:
+        """
+        Convert debate results into an actionable trading signal with
+        per-strategy preferences and risk adjustment.
+
+        CALLED BY: brain.py _llm_analyze_market (after debate)
+        """
+        from app.brain.prompts import SIGNAL_EXTRACTION_SYSTEM, SIGNAL_EXTRACTION_USER
+
+        verdict = debate_result.get("verdict", {})
+        bull = debate_result.get("bull_case", {})
+        bear = debate_result.get("bear_case", {})
+
+        user_prompt = SIGNAL_EXTRACTION_USER.format(
+            bull_thesis=bull.get("thesis", "No bull case"),
+            bull_confidence=bull.get("confidence", 0),
+            bear_thesis=bear.get("thesis", "No bear case"),
+            bear_confidence=bear.get("confidence", 0),
+            verdict_direction=verdict.get("direction", "NEUTRAL"),
+            verdict_conviction=verdict.get("conviction", 0),
+            verdict_reasoning=verdict.get("reasoning", ""),
+            regime=market_data.get("regime", "UNKNOWN"),
+            rsi=market_data.get("rsi", "N/A"),
+            adx=market_data.get("adx", "N/A"),
+            drawdown_pct=market_data.get("drawdown_pct", 0),
+        )
+
+        response = await self._call_gpt_with_retry(
+            SIGNAL_EXTRACTION_SYSTEM, user_prompt, max_tokens=400
+        )
+        if not response or self._is_error_content(response):
+            return None
+
+        parsed = self._parse_json_response(response)
+        if not parsed or "signal" not in parsed:
+            logger.warning("signal_parse_failed", response_preview=response[:100])
+            return None
+
+        insight = self._build_insight(
+            "signal_extraction",
+            response,
+            structured=parsed,
+        )
+        self._store_insight(insight)
+
+        logger.info(
+            "signal_extracted",
+            signal=parsed.get("signal"),
+            confidence=parsed.get("confidence"),
+            risk=parsed.get("risk_adjustment"),
+        )
+        return parsed
+
+    # ------------------------------------------------------------------ #
+    #  Structured Trade Reflection
+    # ------------------------------------------------------------------ #
+
+    async def structured_trade_review(self, trade_data: Dict) -> Optional[Dict]:
+        """
+        Structured post-trade reflection that produces actionable JSON
+        with outcome quality, root cause, lesson, and strategy adjustment.
+
+        CALLED BY: brain.py _llm_review_trade (enhanced pipeline)
+        """
+        from app.brain.prompts import TRADE_REFLECTION_SYSTEM, TRADE_REFLECTION_USER
+
+        profit = trade_data.get("profit", 0)
+        symbol = trade_data.get("symbol", "")
+        strategy = trade_data.get("strategy", "A")
+
+        user_prompt = TRADE_REFLECTION_USER.format(
+            symbol=symbol,
+            strategy=strategy,
+            direction=trade_data.get("direction", "BUY"),
+            entry_price=trade_data.get("entry_price", 0),
+            exit_price=trade_data.get("exit_price", 0),
+            profit=profit,
+            regime=trade_data.get("regime", "N/A"),
+            outcome="WIN" if profit > 0 else "LOSS",
+        )
+
+        response = await self._call_gpt_with_retry(
+            TRADE_REFLECTION_SYSTEM, user_prompt, max_tokens=400
+        )
+        if not response or self._is_error_content(response):
+            return None
+
+        parsed = self._parse_json_response(response)
+        if not parsed or "outcome_quality" not in parsed:
+            logger.warning("reflection_parse_failed", response_preview=response[:100])
+            return None
+
+        insight = self._build_insight(
+            "trade_reflection",
+            response,
+            trade_symbol=symbol,
+            trade_pnl=profit,
+            structured=parsed,
+        )
+        self._store_insight(insight)
+
+        # Store lesson in memory
+        lesson = parsed.get("lesson", "")
+        if lesson and not self._is_error_content(response):
+            self._memory.add(
+                text=f"[{symbol}/{strategy}] {parsed.get('outcome_quality', '?')}: {lesson}",
+                source_type="trade_reflection",
+                importance=0.6 if profit > 0 else 0.7,
+                tags=[
+                    "win" if profit > 0 else "loss",
+                    parsed.get("outcome_quality", ""),
+                    strategy,
+                ],
+                symbol=symbol,
+                strategy=strategy,
+                pnl=profit,
+            )
+
+        logger.info(
+            "trade_reflection_complete",
+            symbol=symbol,
+            strategy=strategy,
+            outcome=parsed.get("outcome_quality"),
+            adjustment=parsed.get("strategy_adjustment", {}).get("direction"),
+        )
+        return parsed
 
     def get_insights(self, limit: int = 20) -> List[Dict]:
         """
@@ -506,4 +937,15 @@ Focus on:
             "model": self._model,
             "insights_count": len(self._insights_history),
             "last_error": last_error,
+            "memory": self._memory.get_stats(),
         }
+
+    @property
+    def memory(self) -> LLMMemory:
+        """Expose the hierarchical memory for external inspection."""
+        return self._memory
+
+    @property
+    def parser(self) -> StructuredOutputParser:
+        """Expose the structured output parser for external use."""
+        return self._parser
