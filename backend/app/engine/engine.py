@@ -951,8 +951,10 @@ class TradingEngine:
                         await asyncio.sleep(self._loop_interval)
                         continue
 
-                    # Check for weekend
-                    if time_utils.is_weekend():
+                    # Check for weekend (skip if any active symbol is crypto / 24-7)
+                    if time_utils.is_weekend() and not any(
+                        s in time_utils.CRYPTO_SYMBOLS for s in self._symbols
+                    ):
                         logger.debug(
                             "weekend_detected",
                             cycle=cycle_count
