@@ -632,3 +632,92 @@ Exit: {exit_price}
 P&L: ${profit:.2f}
 Regime at entry: {regime}
 Win/Loss: {outcome}"""
+
+
+# ---------------------------------------------------------------------------
+# STRATEGY BUILDER PROMPTS
+# Natural language -> structured trading rule conversion
+# ---------------------------------------------------------------------------
+
+STRATEGY_BUILDER_SYSTEM = """You are a quantitative trading strategy parser. Convert natural language trading descriptions into structured JSON strategy definitions.
+
+Available indicators: SMA, EMA, RSI, MACD, Bollinger Bands (BB), ADX, ATR, Stochastic (STOCH), CCI, VWAP, Ichimoku
+Available condition types: crossover, crossunder, threshold, between, slope
+Available actions: BUY, SELL, CLOSE_LONG, CLOSE_SHORT
+
+You MUST respond with ONLY valid JSON matching this exact schema (no extra text, no markdown fences):
+{
+  "name": "short descriptive name (5-8 words max)",
+  "conditions": [
+    {
+      "type": "crossover|crossunder|threshold|between|slope",
+      "subject": {
+        "type": "price|indicator",
+        "field": "close|high|low|open",
+        "name": "SMA|EMA|RSI|MACD|BB|ADX|ATR|STOCH|CCI|VWAP",
+        "period": 14,
+        "source": "close"
+      },
+      "reference": {
+        "type": "indicator|value",
+        "name": "SMA|EMA|RSI|etc",
+        "period": 44,
+        "source": "close"
+      },
+      "operator": "greater_than|less_than|between|equals",
+      "value": 30,
+      "value2": null,
+      "direction": "above|below|rising|falling"
+    }
+  ],
+  "action": "BUY|SELL",
+  "exit_conditions": [
+    {
+      "type": "crossunder",
+      "subject": {"type": "price", "field": "close"},
+      "reference": {"type": "indicator", "name": "SMA", "period": 20, "source": "close"},
+      "direction": "below"
+    }
+  ],
+  "risk": {
+    "sl_atr_mult": 1.5,
+    "tp_atr_mult": 2.0
+  },
+  "suggested_timeframe": "1H|4H|1D|15M|5M",
+  "confidence": 0.85,
+  "warnings": ["list any concerns about the strategy here"]
+}
+
+Rules:
+- If period is not specified, use standard defaults: RSI=14, MACD=12/26/9, BB=20, SMA/EMA=20, ADX=14, ATR=14, STOCH=14, CCI=20
+- Always include at least one exit_condition even if the user does not specify one
+- For crossover/crossunder conditions: the subject crosses the reference
+- For threshold conditions: subject compared to a numeric value via operator
+- Set confidence based on strategy quality (0.5=basic, 0.75=solid, 0.9=well-defined)
+- Include warnings for aggressive thresholds, ambiguous inputs, or missing info
+- If the user mentions "the orange/blue/green line" without specifying which indicator, add a warning
+- Do NOT wrap the JSON in markdown code fences
+- Output ONLY the JSON object, nothing else"""
+
+STRATEGY_BUILDER_USER = """Parse this trading strategy description into a structured JSON definition:
+
+Description: {user_input}
+
+Symbol context: {symbol}
+Market context: {market_context}
+
+Remember: output ONLY the JSON object, no other text."""
+
+
+PINE_SCRIPT_GENERATOR_SYSTEM = """You are a Pine Script v5 code generator. Generate complete, working TradingView Pine Script from a structured strategy definition JSON.
+
+Requirements:
+- Use //@version=5
+- Use strategy() for backtestable scripts (overlay=true)
+- Include all indicator calculations using ta.* built-ins
+- Include strategy.entry() and strategy.exit() calls with ATR-based SL/TP
+- Include alertcondition() with a JSON webhook payload containing action, symbol ({{ticker}}), price ({{close}}), and all indicator values
+- Include plot() calls for overlay indicators
+- Add commission and default_qty settings to strategy()
+- The webhook JSON must be a valid JSON string built with str.tostring() for numerics
+- Output only the Pine Script code, no markdown fences"""

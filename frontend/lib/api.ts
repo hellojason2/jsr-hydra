@@ -286,4 +286,72 @@ export async function getDowPerformance(): Promise<any> {
   return fetchApi<any>("/api/brain/dow-performance")
 }
 
+/**
+ * Chart Vision Analysis
+ */
+export async function analyzeChart(image: File, context?: string): Promise<any> {
+  const formData = new FormData()
+  formData.append("image", image)
+  if (context) formData.append("context", context)
+
+  const token = typeof window !== "undefined" ? localStorage.getItem("auth_token") : null
+  const headers: Record<string, string> = {}
+  if (token) headers["Authorization"] = `Bearer ${token}`
+
+  // Do NOT set Content-Type — the browser sets it automatically with the
+  // correct multipart boundary when sending FormData.
+  const response = await fetch("/api/chart-vision/analyze", {
+    method: "POST",
+    headers,
+    body: formData,
+  })
+
+  if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") {
+      localStorage.removeItem("auth_token")
+      localStorage.removeItem("app-store")
+      window.location.href = "/login"
+    }
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || `API Error: ${response.statusText}`)
+  }
+
+  return response.json()
+}
+
+export async function getChartVisionHistory(): Promise<any[]> {
+  const data = await fetchApi<{ history: any[]; count: number }>("/api/chart-vision/history")
+  return data.history
+}
+
+/**
+ * Strategy Builder APIs
+ */
+export async function parseStrategy(input: string, symbol?: string): Promise<any> {
+  return fetchApi<any>("/api/strategy-builder/parse", {
+    method: "POST",
+    body: JSON.stringify({ input, symbol: symbol || "BTCUSD" }),
+  })
+}
+
+export async function refineStrategy(strategyId: string, feedback: string): Promise<any> {
+  return fetchApi<any>("/api/strategy-builder/refine", {
+    method: "POST",
+    body: JSON.stringify({ strategy_id: strategyId, feedback }),
+  })
+}
+
+export async function getStrategyBuilderHistory(): Promise<any[]> {
+  return fetchApi<{ strategies: any[]; count: number }>("/api/strategy-builder/history").then(
+    (res) => res.strategies
+  )
+}
+
+export async function deployStrategy(strategyId: string, deployAs?: string): Promise<any> {
+  return fetchApi<any>("/api/strategy-builder/deploy", {
+    method: "POST",
+    body: JSON.stringify({ strategy_id: strategyId, deploy_as: deployAs }),
+  })
+}
+
 export { BASE_URL };

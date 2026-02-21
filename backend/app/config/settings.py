@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # Writable directory for brain persistence files (memory, XP, allocator, RL state)
     BRAIN_DATA_DIR: str = "/app/data/brain"
 
+    # TradingView Webhook Configuration
+    # Shared secret used to authenticate inbound TradingView Pine Script webhooks.
+    # Set this to a long random string in production and configure the same value
+    # in your TradingView alert webhook URL body or X-Webhook-Secret header.
+    TRADINGVIEW_WEBHOOK_SECRET: str = "jsr-hydra-tv-webhook-2024"
+
     # Admin Credentials
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin"
