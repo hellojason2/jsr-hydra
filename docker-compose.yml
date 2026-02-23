@@ -233,7 +233,7 @@ services:
       dockerfile: Dockerfile
     container_name: jsr-frontend
     ports:
-      - "3000:3000"
+      - "3001:3000"
     depends_on:
       - jsr-backend
     restart: unless-stopped
