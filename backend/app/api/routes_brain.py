@@ -254,7 +254,7 @@ async def get_rl_stats(
 
 
 class LLMConfigUpdate(BaseModel):
-    provider: Literal["openai", "zai"]
+    provider: Literal["openai", "zai", "groq"]
     model: Optional[str] = None
     api_key: Optional[str] = None
 
@@ -329,27 +329,43 @@ async def get_llm_insights(
     """
     try:
         brain = get_brain()
+        llm_config = brain.get_llm_config()
+
+        def _attach_cadence(stats: dict) -> dict:
+            if not isinstance(stats, dict):
+                return stats
+            if stats.get("cadence_seconds"):
+                return stats
+            cadence = llm_config.get("cadence_seconds")
+            if not cadence:
+                return stats
+            merged = stats.copy()
+            merged["cadence_seconds"] = cadence
+            return merged
+
         # Engine process owns live LLM history; API process should read Redis copy.
         if brain._cycle_count > 0 and brain._llm:
+            stats = _attach_cadence(brain._llm.get_stats())
             return {
                 "insights": brain._llm.get_insights(),
-                "stats": brain._llm.get_stats(),
+                "stats": stats,
             }
         redis_state = brain.load_from_redis()
         if redis_state:
             redis_insights = redis_state.get("llm_insights")
             redis_stats = redis_state.get("llm_stats")
             if redis_insights is not None and redis_stats is not None:
+                stats = _attach_cadence(redis_stats)
                 return {
                     "insights": redis_insights,
-                    "stats": redis_stats,
+                    "stats": stats,
                 }
         if brain._llm:
+            stats = _attach_cadence(brain._llm.get_stats())
             return {
                 "insights": brain._llm.get_insights(),
-                "stats": brain._llm.get_stats(),
+                "stats": stats,
             }
-        llm_config = brain.get_llm_config()
         return {
             "insights": [],
             "stats": {
@@ -362,6 +378,7 @@ async def get_llm_insights(
                 "last_error": llm_config.get("last_error"),
                 "message": llm_config.get("last_error")
                 or "LLM not configured -- set provider API key to enable",
+                "cadence_seconds": llm_config.get("cadence_seconds"),
             },
         }
     except Exception as e:

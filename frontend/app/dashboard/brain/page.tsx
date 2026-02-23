@@ -44,7 +44,7 @@ interface BrainState {
   last_updated: string
 }
 
-type LLMProvider = 'openai' | 'zai'
+type LLMProvider = 'openai' | 'zai' | 'groq'
 
 interface LLMProviderConfig {
   provider: LLMProvider
@@ -68,7 +68,7 @@ export default function BrainPage() {
   const [llmInsights, setLlmInsights] = useState<any[]>([])
   const [llmStats, setLlmStats] = useState<any>(null)
   const [llmConfig, setLlmConfig] = useState<LLMRuntimeConfig | null>(null)
-  const [selectedProvider, setSelectedProvider] = useState<LLMProvider>('openai')
+  const [selectedProvider, setSelectedProvider] = useState<LLMProvider>('groq')
   const [selectedModel, setSelectedModel] = useState('')
   const [llmConfigDirty, setLlmConfigDirty] = useState(false)
   const [savingModelConfig, setSavingModelConfig] = useState(false)
@@ -166,7 +166,7 @@ export default function BrainPage() {
 
           if (!llmConfigDirty) {
             const activeProvider: LLMProvider =
-              configData.provider === 'zai' ? 'zai' : 'openai'
+              configData.provider === 'zai' ? 'zai' : configData.provider === 'groq' ? 'groq' : 'openai'
             const modelsForProvider = configData.models?.[activeProvider] || []
 
             setSelectedProvider(activeProvider)
@@ -227,6 +227,7 @@ export default function BrainPage() {
   const providerOptions: LLMProviderConfig[] = llmConfig?.providers || [
     { provider: 'openai', configured: false, default_model: 'gpt-4o-mini', base_url: '' },
     { provider: 'zai', configured: false, default_model: 'glm-4.6', base_url: '' },
+    { provider: 'groq', configured: false, default_model: 'llama-3.3-70b-versatile', base_url: '' },
   ]
   const selectedProviderConfig = llmConfig?.providers.find((p) => p.provider === selectedProvider) || null
   const modelsForSelectedProvider = llmConfig?.models?.[selectedProvider] || []
@@ -279,7 +280,7 @@ export default function BrainPage() {
       const updatedConfig: LLMRuntimeConfig = await response.json()
       setLlmConfig(updatedConfig)
       setLlmConfigDirty(false)
-      setSelectedProvider(updatedConfig.provider === 'zai' ? 'zai' : 'openai')
+      setSelectedProvider(updatedConfig.provider === 'zai' ? 'zai' : updatedConfig.provider === 'groq' ? 'groq' : 'openai')
       setSelectedModel(updatedConfig.model)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update LLM config')

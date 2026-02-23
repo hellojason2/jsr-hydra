@@ -50,7 +50,7 @@ logger = get_logger("brain")
 MAX_THOUGHTS = 100
 
 # Minimum interval (seconds) between periodic summary thoughts
-PERIODIC_SUMMARY_INTERVAL = 300  # 5 minutes
+PERIODIC_SUMMARY_INTERVAL = max(60, int(settings.BRAIN_PERIODIC_SUMMARY_INTERVAL_SECONDS))
 
 # Strategy names for human-readable output
 STRATEGY_NAMES = {
@@ -61,7 +61,7 @@ STRATEGY_NAMES = {
     "E": "Range Scalper (Sideways)",
 }
 
-LLM_SUPPORTED_PROVIDERS = ("openai", "zai")
+LLM_SUPPORTED_PROVIDERS = ("openai", "zai", "groq")
 
 STRATEGY_CODES = tuple(STRATEGY_NAMES.keys())
 POINTS_START = 100
@@ -69,11 +69,12 @@ POINTS_MIN = 0
 POINTS_MAX = 200
 POINT_BLOCK_THRESHOLD = 25
 POINT_TRADE_MIN_FOR_BLOCK = 5
-LOSS_DIAG_INTERVAL_SECONDS = 900
+LOSS_DIAG_INTERVAL_SECONDS = max(60, int(settings.BRAIN_LOSS_DIAG_INTERVAL_SECONDS))
 
 LLM_MODELS_BY_PROVIDER = {
     "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
     "zai": ["glm-5", "glm-4.6", "glm-4.5-air"],
+    "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama-4-scout-17b-16e-instruct", "llama-4-maverick-17b-128e-instruct"],
 }
 
 
@@ -255,6 +256,8 @@ class Brain:
             return settings.OPENAI_API_KEY
         if provider == "zai":
             return settings.ZAI_API_KEY
+        if provider == "groq":
+            return settings.GROQ_API_KEY
         return ""
 
     def _get_provider_default_model(self, provider: str) -> str:
@@ -262,6 +265,8 @@ class Brain:
             return settings.OPENAI_MODEL or "gpt-4o-mini"
         if provider == "zai":
             return settings.ZAI_MODEL or "glm-4.6"
+        if provider == "groq":
+            return settings.GROQ_MODEL or "llama-3.3-70b-versatile"
         return ""
 
     def _get_provider_base_url(self, provider: str) -> str:
@@ -269,6 +274,8 @@ class Brain:
             return settings.OPENAI_BASE_URL
         if provider == "zai":
             return settings.ZAI_BASE_URL
+        if provider == "groq":
+            return settings.GROQ_BASE_URL
         return ""
 
     def _get_supported_models(self, provider: str) -> List[str]:
@@ -410,6 +417,22 @@ class Brain:
             source="redis_sync",
         )
 
+    def _get_cadence_seconds(self) -> Dict[str, int]:
+        """
+        Return active runtime cadence settings for operational visibility.
+        """
+        analysis_seconds = max(60, int(settings.BRAIN_LLM_ANALYSIS_INTERVAL_SECONDS))
+        review_seconds = max(300, int(settings.BRAIN_LLM_REVIEW_INTERVAL_SECONDS))
+        if self._llm:
+            analysis_seconds = int(getattr(self._llm, "_analysis_interval", analysis_seconds))
+            review_seconds = int(getattr(self._llm, "_review_interval", review_seconds))
+        return {
+            "periodic_summary": PERIODIC_SUMMARY_INTERVAL,
+            "llm_market_analysis": analysis_seconds,
+            "llm_strategy_review": review_seconds,
+            "loss_diagnosis": LOSS_DIAG_INTERVAL_SECONDS,
+        }
+
     def get_llm_config(self) -> dict:
         """Return current and available LLM runtime options for dashboard UI."""
         self._refresh_llm_config_from_redis(force=True)
@@ -434,6 +457,7 @@ class Brain:
                 provider: self._get_supported_models(provider)
                 for provider in LLM_SUPPORTED_PROVIDERS
             },
+            "cadence_seconds": self._get_cadence_seconds(),
         }
 
     def set_llm_config(self, provider: str, model: Optional[str] = None, api_key: Optional[str] = None) -> dict:
@@ -1264,6 +1288,7 @@ class Brain:
                     "provider": self._llm_provider,
                     "model": self._llm_model,
                     "last_error": self._llm_last_error,
+                    "cadence_seconds": self._get_cadence_seconds(),
                 },
                 # LLM outputs for cross-process dashboard reads
                 "llm_insights": self._llm.get_insights() if self._llm else [],
@@ -1274,6 +1299,7 @@ class Brain:
                     "total_tokens_used": 0,
                     "estimated_cost_usd": 0,
                     "insights_count": 0,
+                    "cadence_seconds": self._get_cadence_seconds(),
                 },
             }
 
@@ -1301,6 +1327,7 @@ class Brain:
                 "provider": self._llm_provider,
                 "model": self._llm_model,
                 "last_error": self._llm_last_error,
+                "cadence_seconds": self._get_cadence_seconds(),
             },
             "llm_insights": [],
             "llm_stats": {
@@ -1310,6 +1337,7 @@ class Brain:
                 "total_tokens_used": 0,
                 "estimated_cost_usd": 0,
                 "insights_count": 0,
+                "cadence_seconds": self._get_cadence_seconds(),
             },
         }
 
@@ -2589,6 +2617,16 @@ class Brain:
 
         # Add RL summary
         parts.append(f"RL trades analyzed: {self._learner._rl_total_trades}.")
+
+        if self._llm:
+            try:
+                memory_stats = self._llm.get_stats().get("memory", {})
+                total_memories = memory_stats.get("total_memories")
+                if total_memories is not None:
+                    parts.append(f"LLM memories tracked: {total_memories}.")
+            except Exception:
+                # Learning telemetry is optional in summary thoughts.
+                pass
 
         parts.append(f"Processed {self._cycle_count} cycles.")
 

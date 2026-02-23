@@ -108,7 +108,10 @@ services:
       - ZAI_API_KEY=${ZAI_API_KEY:-}
       - ZAI_MODEL=${ZAI_MODEL:-glm-4.6}
       - ZAI_BASE_URL=${ZAI_BASE_URL:-https://api.z.ai/api/paas/v4/chat/completions}
-      - BRAIN_LLM_PROVIDER=${BRAIN_LLM_PROVIDER:-openai}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      - GROQ_BASE_URL=${GROQ_BASE_URL:-https://api.groq.com/openai/v1/chat/completions}
+      - BRAIN_LLM_PROVIDER=${BRAIN_LLM_PROVIDER:-groq}
     env_file:
       - .env
     volumes:
@@ -156,7 +159,10 @@ services:
       - ZAI_API_KEY=${ZAI_API_KEY:-}
       - ZAI_MODEL=${ZAI_MODEL:-glm-4.6}
       - ZAI_BASE_URL=${ZAI_BASE_URL:-https://api.z.ai/api/paas/v4/chat/completions}
-      - BRAIN_LLM_PROVIDER=${BRAIN_LLM_PROVIDER:-openai}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      - GROQ_BASE_URL=${GROQ_BASE_URL:-https://api.groq.com/openai/v1/chat/completions}
+      - BRAIN_LLM_PROVIDER=${BRAIN_LLM_PROVIDER:-groq}
     env_file:
       - .env
     depends_on:

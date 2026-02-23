@@ -7,6 +7,7 @@ import { getLLMConfig, updateLLMConfig, LLMConfig } from '@/lib/api'
 const PROVIDER_DISPLAY: Record<string, { name: string; description: string }> = {
   openai: { name: 'OpenAI', description: 'GPT-4o, GPT-4 Turbo' },
   zai: { name: 'Z.AI', description: 'Zeus, Athena models' },
+  groq: { name: 'Groq', description: 'Llama 3.3 70B, Llama 4' },
 }
 
 export function LLMModelSelector() {
@@ -131,7 +132,7 @@ export function LLMModelSelector() {
       {!loading && config && (
         <>
           {/* Provider Cards */}
-          <div className="grid grid-cols-2 gap-3 mb-6">
+          <div className="grid grid-cols-3 gap-3 mb-6">
             {config.providers.map((provider) => {
               const isActive = selectedProvider === provider.provider
               const display = PROVIDER_DISPLAY[provider.provider] || {

@@ -49,7 +49,7 @@ def _get_parser_and_generator() -> tuple:
         raise HTTPException(
             status_code=503,
             detail=(
-                "LLM is not configured. Set OPENAI_API_KEY or ZAI_API_KEY in settings "
+                "LLM is not configured. Set GROQ_API_KEY, OPENAI_API_KEY, or ZAI_API_KEY in settings "
                 "and select a provider in the Brain dashboard."
             ),
         )

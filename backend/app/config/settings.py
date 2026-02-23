@@ -58,14 +58,24 @@ class Settings(BaseSettings):
     ZAI_MODEL: str = "glm-4.6"
     ZAI_BASE_URL: str = "https://api.z.ai/api/paas/v4/chat/completions"
 
+    # Groq LLM Configuration
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_BASE_URL: str = "https://api.groq.com/openai/v1/chat/completions"
+
     # Finnhub API Key (free tier — register at finnhub.io)
     # Used for economic calendar data in sentiment module
     FINNHUB_API_KEY: str = ""
 
-    # Brain runtime selection (openai | zai)
+    # Brain runtime selection (openai | zai | groq)
     BRAIN_LLM_PROVIDER: str = "openai"
     # Writable directory for brain persistence files (memory, XP, allocator, RL state)
     BRAIN_DATA_DIR: str = "/app/data/brain"
+    # Brain/LLM cadence controls (seconds)
+    BRAIN_PERIODIC_SUMMARY_INTERVAL_SECONDS: int = 300  # 5 minutes
+    BRAIN_LLM_ANALYSIS_INTERVAL_SECONDS: int = 900  # 15 minutes
+    BRAIN_LLM_REVIEW_INTERVAL_SECONDS: int = 3600  # 1 hour
+    BRAIN_LOSS_DIAG_INTERVAL_SECONDS: int = 900  # 15 minutes
 
     # TradingView Webhook Configuration
     # Shared secret used to authenticate inbound TradingView Pine Script webhooks.
